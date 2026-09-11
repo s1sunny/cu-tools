@@ -64,7 +64,7 @@ TTXC_HARVEST_WAIT_SECONDS = read_int_env(
 )
 MARKET_WAIT_MAX_SECONDS = read_int_env("UNICOM_MARKET_WAIT_MAX", default=300, minimum=0)
 MARKET_API_RETRIES = read_int_env("UNICOM_MARKET_API_RETRIES", default=3, minimum=1)
-MARKET_API_RETRY_BASE_SECONDS = 0.5
+MARKET_API_RETRY_BASE_SECONDS = 0.15
 TTXC_NEWBIE_STEPS = [
     "G01",
     "G02",
@@ -122,12 +122,9 @@ UPHONE_CHANNEL_H5 = "ST-Jingang002"
 UPHONE_EDOP_APP_ID = "edop_unicom_68e8fa69"
 
 # 歌手2026活动
-SINGER_ACTIVITY_ID = "MzE="
-SINGER_CLIENT_ID = "1001000035"
-SINGER_TEMPLATE_ID = "2082343732758274048"
 UPHONE_ACT_SIGN = "Points_Sign_2507"
 UPHONE_ACT_OBTAIN = "Points_Obtain_2507"
-UPHONE_ACT_EXCHANGE = "Points_Exchange_2507"
+UPHONE_ACT_EXCHANGE = "Points_Exchange_2507"  # 2508 无效; 2507 列表无十连商品(2026031010) → 十连暂不可用
 UPHONE_ACT_SUMMER = "HD2026062200218"
 UPHONE_GOODS_LOTTERY_10 = "2026031010"
 UPHONE_LOTTERY_COST = read_int_env("UNICOM_UPHONE_LOTTERY_COST", default=100, minimum=1)
@@ -1125,6 +1122,16 @@ class Unicom:
         try:
             if not self.market_token:
                 return
+            # 预拉优化: 未到10点时先查会员状态, 避开开抢瞬间接口洪峰
+            self.market_prefetched_info = None
+            self.market_prefetched_act = None
+            if not self.market_is_open():
+                self.market_prefetched_info = await self.market_fetch_select_info()
+                if self.market_prefetched_info:
+                    self.tlog("优享权益: 开抢前已预拉会员状态 ✅")
+                self.market_prefetched_act = await self.market_fetch_youchoice_activity()
+                if self.market_prefetched_act:
+                    self.tlog("优享权益: 开抢前已预拉活动数据 ✅")
             if not await self.market_wait_until_open():
                 return
             if not self.market_is_open():
@@ -1133,8 +1140,33 @@ class Unicom:
 
             await asyncio.sleep(max(0, (self.idx - 1) * 0.15))
 
-            if not await self.market_fetch_select_info():
-                return
+            if self.market_prefetched_info is None:
+                if not await self.market_fetch_select_info():
+                    return
+
+            # 10点直发: 用预拉活动数据直接提交抢购(跳过查询/解锁/拦截判断)
+            if self.market_prefetched_act:
+                act = self.market_prefetched_act
+                items = self.market_build_try_order(act.get("detailList") or [])
+                if items:
+                    self.tlog(f"优享权益: 10点直发抢购({len(items)}个商品)")
+                    for i, item in enumerate(items):
+                        name = item.get("productName", "")
+                        try:
+                            res = await self.market_receive_rights(act, item)
+                        except ValueError as e:
+                            self.tlog(f"优享权益: [{name}] 直发失败 {e}")
+                            continue
+                        code = safe_int(res.get("code"), -1)
+                        if code == 200:
+                            self.tlog(f"优享权益: [{name}] 成功(10点直发)")
+                            return
+                        msg = str(res.get("msg", ""))
+                        self.tlog(f"优享权益: [{name}] 直发失败 {msg or res}")
+                        if self.market_should_try_next(msg):
+                            continue
+                        break
+                    self.tlog("优享权益: 直发未成功, 降级走常规流程")
 
             act = await self.market_fetch_youchoice_activity()
             if not act:
@@ -1776,13 +1808,22 @@ class Unicom:
         )
         if not ticket:
             return
+        # 9 月改版后 draw 接口有会话校验：必须先访问活动落地页，让服务端下发会话 cookie
+        if self.last_ticket_url:
+            await self.req("GET", self.last_ticket_url, headers={"User-Agent": UA})
+        # 完整落地页 URL 作 Referer（9 月改版后 draw 系列接口校验 referer/origin）
+        xj_referer = self.last_ticket_url or (
+            "https://zy100.xj169.com/touchpoint/openapi/jumpHandRoom1G"
+            f"?source=155&type=02&ticket={ticket}"
+        )
 
         # 获取token
         r = await self.req(
             "POST",
             "https://zy100.xj169.com/touchpoint/openapi/getTokenAndCity",
             headers={
-                "Referer": f"https://zy100.xj169.com/touchpoint/openapi/jumpHandRoom1G?source=155&type=02&ticket={ticket}",
+                "Referer": xj_referer,
+                "Origin": "https://zy100.xj169.com",
                 "X-Requested-With": "XMLHttpRequest",
                 "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
             },
@@ -1816,13 +1857,15 @@ class Unicom:
         now = datetime.now()
         month_activity_id = f"{month_abbr[now.month - 1]}{now.year}Act"
 
-        # 获取commHighFlag
-        xj_comm_high_flag = ""
+        # 获取commHighFlag（服务端要求小写字符串 true/false）
+        xj_comm_high_flag = "false"
         r = await self.req(
             "POST",
             "https://zy100.xj169.com/touchpoint/openapi/themeAct/commonHightRest",
             headers={
                 "userToken": token,
+                "Referer": xj_referer,
+                "Origin": "https://zy100.xj169.com",
                 "X-Requested-With": "XMLHttpRequest",
                 "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
             },
@@ -1833,7 +1876,10 @@ class Unicom:
             and isinstance(res, dict)
             and res.get("code") in [0, "SUCCESS"]
         ):
-            xj_comm_high_flag = res.get("data", "")
+            raw_flag = res.get("data", False)
+            xj_comm_high_flag = (
+                "true" if raw_flag is True or str(raw_flag).lower() == "true" else "false"
+            )
 
         # 每月主题抽奖
         r = await self.req(
@@ -1841,6 +1887,8 @@ class Unicom:
             f"https://zy100.xj169.com/touchpoint/openapi/themeAct/draw_{month_activity_id}",
             headers={
                 "userToken": token,
+                "Referer": xj_referer,
+                "Origin": "https://zy100.xj169.com",
                 "X-Requested-With": "XMLHttpRequest",
                 "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
             },
@@ -1856,6 +1904,24 @@ class Unicom:
                 self.tlog(f"每月抽奖: {data}")
             elif res.get("code") in [0, "SUCCESS"]:
                 self.tlog(f"每月抽奖: {msg or data}")
+                # 中奖后与活动页一致：下发短信
+                prize_code = str(msg or "")
+                if prize_code and prize_code != "thanks1":
+                    await self.req(
+                        "POST",
+                        "https://zy100.xj169.com/touchpoint/openapi/marchAct/draw_SMS",
+                        headers={
+                            "userToken": token,
+                            "Referer": xj_referer,
+                            "Origin": "https://zy100.xj169.com",
+                            "X-Requested-With": "XMLHttpRequest",
+                            "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+                        },
+                        data={
+                            "activityId": month_activity_id,
+                            "prizeId": prize_code,
+                        },
+                    )
             elif data and (
                 "已经打过卡" in str(data)
                 or "机会已用完" in str(data)
@@ -1865,34 +1931,39 @@ class Unicom:
             else:
                 self.tlog(f"每月抽奖: {data or msg}")
 
-        # 每日打卡抽奖
-        await asyncio.sleep(1)
-        r = await self.req(
-            "POST",
-            f"https://zy100.xj169.com/touchpoint/openapi/themeAct/draw_{month_activity_id}",
-            headers={
-                "userToken": token,
-                "X-Requested-With": "XMLHttpRequest",
-                "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
-            },
-            data={
-                "activityId": f"daka{month_activity_id}",
-                "prizeId": "daka_sftczxqb_twenty",
-                "commHighFlag": xj_comm_high_flag,
-            },
-        )
-        if (res := r["data"]) and isinstance(res, dict):
-            msg, data = res.get("msg"), res.get("data")
-            if msg == "thanks1":
-                self.tlog(f"每日打卡: {data}")
-            elif res.get("code") in [0, "SUCCESS"]:
-                self.tlog(f"每日打卡: {msg or data}")
-            elif res.get("msgType") == "200":
-                self.tlog("每日打卡: 已打过卡")
-            elif data and ("已经打过卡" in str(data) or "机会已用完" in str(data)):
-                self.tlog(f"每日打卡: {data}")
-            else:
-                self.tlog(f"每日打卡: {data or msg}")
+        # 每日打卡抽奖（页面上有两个打卡按钮，逐个尝试）
+        for idx, daka_prize in enumerate(
+            ("daka_sftczxqb_twenty", "daka_mtwmhblly"), start=1
+        ):
+            await asyncio.sleep(1)
+            r = await self.req(
+                "POST",
+                f"https://zy100.xj169.com/touchpoint/openapi/themeAct/draw_{month_activity_id}",
+                headers={
+                    "userToken": token,
+                    "Referer": xj_referer,
+                    "Origin": "https://zy100.xj169.com",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+                },
+                data={
+                    "activityId": f"daka{month_activity_id}",
+                    "prizeId": daka_prize,
+                    "commHighFlag": xj_comm_high_flag,
+                },
+            )
+            if (res := r["data"]) and isinstance(res, dict):
+                msg, data = res.get("msg"), res.get("data")
+                if msg == "thanks1":
+                    self.tlog(f"每日打卡{idx}: {data}")
+                elif res.get("code") in [0, "SUCCESS"]:
+                    self.tlog(f"每日打卡{idx}: {msg or data}")
+                elif res.get("msgType") == "200":
+                    self.tlog(f"每日打卡{idx}: 已打过卡")
+                elif data and ("已经打过卡" in str(data) or "机会已用完" in str(data)):
+                    self.tlog(f"每日打卡{idx}: {data}")
+                else:
+                    self.tlog(f"每日打卡{idx}: {data or msg}")
 
     # === 6. 安全管家 ===
     async def sec_task(self):
@@ -2023,60 +2094,9 @@ class Unicom:
                     self.tlog("签到完成")
                     break
 
-        # 助理代接
-        await asyncio.sleep(1)
-        await self.req(
-            "POST",
-            "https://ims.wo116114.com/api/Assistant/assis_save",
-            headers={
-                "auth-sa-token": self.sec_token,
-                "Content-Type": "application/json",
-            },
-            json={
-                "page_type": 1,
-                "old_ainumber": "XF0",
-                "level": 3,
-                "dialog": "0",
-                "opertype": 1,
-                "videoimage": "",
-                "speechtype": "06",
-                "ainumber": "BD1",
-            },
-        )
-
-        # 号段拦截（每月任务）
-        await asyncio.sleep(1)
-        url = "https://uca.wo116114.com/sjgj/woAssistant/umm/configs/v1/config?product_line=uasp&entry_point=h5&entry_point_id=wxdefbc1986dc757a6"
-        item = {
-            "checked": True,
-            "content": "1",
-            "contentName": "拦截400开头的10位特服号码",
-            "contentTag": "1",
-        }
-        base = {"productId": "91351080", "type": 7, "operationType": 0}
-
-        async def sec_uca_post(data):
-            return await self.req(
-                "POST",
-                url,
-                headers={
-                    "auth-sa-token": self.sec_token,
-                    "Content-Type": "application/json",
-                },
-                json=data,
-            )
-
-        await sec_uca_post({**base, "contents": [item]})
-        await asyncio.sleep(2)
-        item["checked"] = False
-        item["content"] = "0"
-        await sec_uca_post({**base, "contents": [item]})
-        await asyncio.sleep(2)
-        item["checked"] = True
-        item["content"] = "1"
-        await sec_uca_post({**base, "contents": [item]})
-
-        self.tlog("代接/拦截完成")
+        # 注: 代接/号段拦截/黑名单等操作任务需真机微信小程序(瑞数设备指纹), VPS无法完成
+        #     仅签到可自动化 (2026-08-08 实测确认)
+        self.tlog("签到完成")
 
     # === 7. 通通农场（通通乡村）===
     def ttxc_headers(self, auth=True, ecs=False):
@@ -3755,11 +3775,19 @@ class Unicom:
         goods = body.get("data") or []
         if not isinstance(goods, list):
             return -1
+        # 打印全部商品 ID 便于排查 (2026-08-06: 十连商品可能不在列表)
+        ids = [str(g.get("goodsId")) for g in goods if isinstance(g, dict)]
+        self.tlog(f"兑换商品列表 goodsId={ids}")
+        for g in goods:
+            if isinstance(g, dict):
+                self.tlog(f"商品: id={g.get('goodsId')} name={str(g.get('goodsName'))[:40]} remain={g.get('remainUser')} price={g.get('score') or g.get('price')}")
         for g in goods:
             if not isinstance(g, dict):
                 continue
             if str(g.get("goodsId")) == UPHONE_GOODS_LOTTERY_10:
                 ru = g.get("remainUser")
+                # 打印完整字段便于排查 (2026-08-06: 余额200+但remainUser=0)
+                self.tlog(f"十连商品完整字段: {str(g)[:300]}")
                 return -1 if ru is None else safe_int(ru, 0)
         return 0
 
@@ -4026,187 +4054,386 @@ class Unicom:
         await self.uphone_summer_lottery()
         self.tlog("结束")
 
-    # === 10. 歌手2026活动（UniClaw + AI入戏 + 抽奖）===
-    async def singer_task(self):
-        """歌手2026: 每日 UniClaw体验 + AI入戏制作，抽奖机会自动抽完。
-        转存仅需一次（开启活动），不做每日任务。
-        """
-        self._task_tag = "歌手2026"
-        pan_token = self.cloud_disk_token()
-        mobile = self.mobile
-        if not pan_token or not mobile:
-            self.tlog("缺少云盘 token 或手机号，跳过")
-            return
-        try:
-            await self._singer_run(pan_token, mobile)
-        except Exception as e:
-            self.tlog_exc(e, "歌手2026")
 
-    async def _singer_run(self, pan_token, mobile):
-        postage = hashlib.md5(mobile.encode()).hexdigest()
-        referer = (
-            f"https://panservice.mail.wo.cn/h5/activitymobile/singer2026?"
-            f"activityId={SINGER_ACTIVITY_ID}&type=06&ticket=api&version=iphone_c%4012.1400"
-            f"&timestamp={datetime.now():%Y%m%d%H%M%S}&desmobile={mobile}"
-            f"&num=0&postage={postage}&clientid=1001000003&token={pan_token}"
-            f"&touchpoint=300200030004&userNumber={mobile}"
-        )
-        act_headers = {
-            "token": pan_token, "accesstoken": pan_token,
-            "access-token": pan_token, "x-yp-access-token": pan_token,
-            "clientid": SINGER_CLIENT_ID, "client-id": SINGER_CLIENT_ID,
-            "x-yp-client-id": SINGER_CLIENT_ID,
-            "x-yp-app-version": "5.4.2", "x-yp-open-version": "v1.0",
-            "x-cm-service": "PHONE", "x-path": "/h5/activitymobile/singer2026/main1",
+
+    # === 11. 沃阅读/爱听积分 (每账号自动换票) ===
+    async def woread_task(self):
+        """沃阅读积分: ecs_token → accountLogin 换凭证 → 换票 → 刷时长 → 领积分
+        链路: chinaUnicomCookie → onLine(ecs_token) → /account/login(手机号) → token/verifyCode
+              → getPointCenterTicket → well ticket → addReadTime 刷时长 → jftask toFinish
+        """
+        self._task_tag = "沃阅读积分"
+        self.tlog("开始")
+        import json as _json
+        BASE = "https://10010.woread.com.cn/ng_woread_service/rest"
+        KEY = b"woreadst^&*12345"
+        IV = b"16-Bytes--String"
+        APPID = "10000002"
+        APPSECRET = "7k1HcDL8RKvc"
+
+        def get_aes(data: dict) -> str:
+            """getAes: AES-CBC(key,iv) 加密 JSON → hex → base64"""
+            plain = _json.dumps(data, separators=(",", ":"))
+            c = AES.new(KEY, AES.MODE_CBC, iv=IV)
+            ct = c.encrypt(pad(plain.encode(), 16))
+            return base64.b64encode(ct.hex().encode()).decode()
+
+        def get_aes2(phone: str) -> str:
+            """getAes2: 同 AES-CBC 加密手机号"""
+            c = AES.new(KEY, AES.MODE_CBC, iv=IV)
+            ct = c.encrypt(pad(phone.encode(), 16))
+            return base64.b64encode(ct.hex().encode()).decode()
+
+        def ts_now() -> str:
+            return datetime.now().strftime("%Y%m%d%H%M%S")
+
+        # woread H5 请求头 (带 App 登录态 cookie)
+        hdrs = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)  unicom{version:iphone_c@12.1400}",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Referer": "https://10010.woread.com.cn/ng_woread/",
+            "Origin": "https://10010.woread.com.cn",
+        }
+        # 种 App 登录态 cookie (ecs_token/t3_token 等来自 self.client)
+        self.client.cookies.set("ecs_token", self.ecs_token, domain=".woread.com.cn")
+        self.client.cookies.set("ecs_token", self.ecs_token, domain=".10010.com.cn")
+        self.client.cookies.set("u_account", self.mobile, domain=".woread.com.cn")
+
+        async def woread_post(path: str, data: dict, **kw):
+            return await self.req("POST", BASE + path, headers=hdrs, json={"sign": get_aes(data)}, **kw)
+
+        try:
+            # ① getAccessToken (无需登录态)
+            ts_ms = str(int(time.time() * 1000))
+            md5sig = hashlib.md5(f"{APPID}{APPSECRET}{ts_ms}".encode()).hexdigest()
+            r = await self.req("POST", f"{BASE}/app/auth/{APPID}/{ts_ms}/{md5sig}",
+                               headers=hdrs,
+                               json={"sign": get_aes({"timestamp": ts_now()})})
+            accesstoken = ""
+            if (res := r["data"]) and res.get("code") == "0000":
+                accesstoken = res.get("data", {}).get("accesstoken", "")
+            if not accesstoken:
+                self.tlog(f"getAccessToken 失败: {api_response_err(r, 'app/auth')}")
+                return
+            hdrs["accesstoken"] = accesstoken
+
+            # ② accountLogin: 手机号 AES2 加密 → token/verifyCode
+            payload = {"phone": get_aes2(self.mobile), "timestamp": ts_now()}
+            r = await self.req("POST", BASE + "/account/login",
+                               headers={**hdrs, "noPassToken": "true"},
+                               json={"sign": get_aes(payload)})
+            if not (res := r["data"]) or res.get("code") != "0000":
+                self.tlog(f"accountLogin 失败: {api_response_err(r, 'account/login')}")
+                return
+            d = res.get("data", {})
+            token = d.get("token", "")
+            verify_code = d.get("verifycode", "")
+            user_id = d.get("userid", "")
+            user_index = d.get("userindex", "")
+            if not token or not verify_code:
+                self.tlog(f"accountLogin 凭证不完整: {d}")
+                return
+            self.tlog(f"登录成功: {self.mobile[:3]}****{self.mobile[-4:]} 凭证已换")
+            user_fields = {
+                "token": token, "userId": user_id, "userIndex": user_index,
+                "userAccount": self.mobile, "verifyCode": verify_code,
+            }
+
+            # ③ 换票: getPointCenterTicket → well URL + ticket
+            r = await woread_post("/activity/getPointCenterTicket", {"timestamp": ts_now(), **user_fields})
+            well_url = ""
+            if (res := r["data"]) and res.get("code") == "0000":
+                well_url = res.get("data", "") or ""
+            if not well_url or "ticket=" not in well_url:
+                self.tlog(f"换票失败: {api_response_err(r, 'getPointCenterTicket')}")
+                return
+            ticket = re.search(r"ticket=([^&]+)", well_url).group(1)
+            self.tlog(f"换票成功 ticket={ticket[:16]}...")
+
+            # ④ getSecretKey
+            WELL_UA = hdrs["User-Agent"]
+            r = await self.req(
+                "GET",
+                "https://m.jf.10010.com/jf-external-application/jftask/getSecretKey",
+                headers={
+                    "ticket": ticket, "partnersid": "1706", "clienttype": "aiting_unicom",
+                    "User-Agent": WELL_UA, "Referer": well_url,
+                    "Accept": "application/json, text/plain, */*",
+                },
+            )
+            if not (res := r["data"]) or str(res.get("code")) != "0000":
+                self.tlog(f"getSecretKey 失败: {api_response_err(r, 'getSecretKey')}")
+                return
+            secret_key = res.get("data", {}).get("secretKey", "")
+            if not secret_key:
+                self.tlog("getSecretKey 无密钥")
+                return
+            jea = ""
+            for ck in iter_set_cookies(r["headers"]):
+                if "_jea_id=" in ck:
+                    jea = ck.split("_jea_id=")[1].split(";")[0]
+                    break
+
+            def jf_headers():
+                ts, nonce = str(int(time.time() * 1000)), "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+                sig = hmac.new(secret_key.encode(), f"{nonce}{ts}".encode(), hashlib.sha256).hexdigest()
+                return {
+                    "ticket": ticket, "User-Agent": WELL_UA, "partnersid": "1706",
+                    "clienttype": "aiting_unicom", "Cookie": f"_jea_id={jea}",
+                    "X-Request-Timestamp": ts, "X-Request-Nonce": nonce,
+                    "X-Request-Signature": sig, "Referer": well_url,
+                    "Origin": "https://m.jf.10010.com",
+                    "Content-Type": "application/json;charset=UTF-8",
+                    "Accept": "application/json, text/plain, */*",
+                }
+
+            # ⑤ 阅读刷时长: readChapter → newreadadd → addReadTime 三步完整复刻
+            #    (新账号必须先读章节建立阅读记录, 每次运行报1次+2分钟, 服务端约10-15分钟冷却
+            #     0/7/10点三次运行累计 → 读听看4分钟任务 2/2 完成)
+            chapter_params = {
+                "chapterSeno": "3", "cntIndex": 3120941, "beginChapter": 4,
+                "timestamp": ts_now(), **user_fields,
+            }
+            # 必须 POST (HAR 实测: GET 报"请求方式不正确", 阅读会话不建立,
+            # addReadTime 虽返回0000但任务不计时 → toFinish 假成功)
+            r = await self.req(
+                "POST",
+                f"{BASE}/cnt/readChapter?cntindex=3120941&chapterallindex=120470473&chapterseno=3",
+                headers=hdrs, json={"sign": get_aes(chapter_params)},
+            )
+            if (res := r["data"]) and res.get("code") == "0000":
+                self.tlog(f"readChapter 读章节成功 (章节数={len(res.get('list', []))})")
+            else:
+                self.tlog(f"readChapter: {api_response_err(r, 'readChapter')}")
+            await asyncio.sleep(1)
+
+            newreadadd_data = {
+                "userid": user_fields["userId"], "cntindex": 3120941,
+                "chapterallindex": 120470473, "cnttype": 1,
+                "cntname": "大清权臣李鸿章", "chaptertitle": "少年，胸怀壮志",
+                "readtype": 1, "timestamp": ts_now(), **user_fields,
+            }
+            r = await self.req("POST", BASE + "/basics/newreadadd",
+                               headers=hdrs, json={"sign": get_aes(newreadadd_data)})
+            if (res := r["data"]) and res.get("code") == "0000":
+                self.tlog("newreadadd 更新阅读进度成功")
+            await asyncio.sleep(1)
+
+            read_data = {
+                "readTime": 2,
+                "cntIndex": 3120941, "cntType": 1, "cntindex": 3120941, "cnttype": 1,
+                "chapterallindex": 120470473, "chapterseno": 3,
+                "channelid": "18000688", "chapterid": "13120941003",
+                "readtype": 1, "isend": "0",
+                "timestamp": ts_now(), **user_fields,
+            }
+            r = await self.req("POST", BASE + "/history/addReadTime",
+                               headers=hdrs, json={"sign": get_aes(read_data)})
+            if (res := r["data"]) and res.get("code") == "0000":
+                self.tlog(f"阅读上报: +2分钟 (weektime={res.get('data', {}).get('weektime')})")
+            else:
+                self.tlog(f"阅读上报: {api_response_err(r, 'addReadTime')} (冷却中/已满, 0点下次再报)")
+
+            # ⑥ 签到 (爱看/爱听签到, 每日+1)
+            r = await self.req("POST", "https://m.jf.10010.com/jf-external-application/uasptask/sign",
+                               headers=jf_headers(), json={"taskCode": "s818795876839563264"})
+            if (res := r["data"]) and res.get("code") == "0000":
+                self.tlog(f"签到成功: {res.get('data', {}).get('title', '')} (+{res.get('data', {}).get('score', '')})")
+            else:
+                self.tlog(f"签到: {api_response_err(r, 'sign')} (可能已签)")
+
+            # ⑥ taskDetail + toFinish 领积分
+            r = await self.req("POST", "https://m.jf.10010.com/jf-external-application/jftask/taskDetail",
+                               headers=jf_headers(), json={})
+            if not (res := r["data"]) or res.get("code") != "0000":
+                self.tlog(f"taskDetail 失败: {api_response_err(r, 'taskDetail')}")
+                return
+            tasks = res.get("data", {}).get("taskDetail", {}).get("taskList", [])
+            # 已实测(2026-08-07 taskRecords 验证):
+            #   ✅ 真到账: 登录并读听看4分钟(读听看/新手) + 签到 → 保留
+            #   ❌ 假成功: 分享爱听内容 toFinish 返回 true 但积分不到账
+            #      (需真实微信分享回调, API 直调无效) → 跳过
+            #   ❌ 不可行: 邀请(需真新用户) / 会员(需付费) / 限时福利(需爱看App) → 跳过
+            skip_kw = ("邀请", "会员", "分享", "限时福利")
+            claimed = 0
+            for t in tasks:
+                name = t.get("taskName", "")
+                if any(k in name for k in skip_kw):
+                    continue
+                if t.get("finishCount", 0) >= t.get("needCount", 1):
+                    continue
+                r2 = await self.req("POST", "https://m.jf.10010.com/jf-external-application/jftask/toFinish",
+                                    headers=jf_headers(), json={"taskCode": t.get("taskCode")})
+                ok = (res2 := r2["data"]) and res2.get("data") is True
+                self.tlog(f"领积分 [{name}]: {'成功' if ok else '未达条件'}")
+                if ok:
+                    claimed += 1
+                await asyncio.sleep(1)
+            # 查询今日积分
+            r3 = await self.req("POST", "https://m.jf.10010.com/jf-external-application/jftask/userInfo",
+                                headers=jf_headers(), json={})
+            if (res3 := r3["data"]) and res3.get("code") == "0000":
+                ui = res3.get("data", {})
+                self.tlog(f"今日积分: {ui.get('todayEarnScore')} 可用: {ui.get('availableScore')} 累计: {ui.get('allEarnScore')}")
+            self.tlog(f"结束: 共领 {claimed} 项积分")
+        except Exception as e:
+            self.tlog_exc(e, "沃阅读积分")
+
+    # === 12. 云盘校园季（燃动开学季）: 每日上传 + 抽奖 ===
+    CAMPUS_ACTIVITY_ID = "MzU="
+    CAMPUS_UPLOAD_URL = "https://tjupload.pan.wo.cn/openapi/client/upload2C"
+
+    def campus_headers(self):
+        token = self.cloud_disk_token()
+        return {
+            "X-YP-Access-Token": token,
+            "token": token,
+            "Access-Token": token,
             "source-type": "woapi",
-            "requesttime": str(int(time.time() * 1000)),
-            "content-type": "application/json",
-            "user-agent": UA, "referer": referer, "origin": "https://panservice.mail.wo.cn",
+            "clientId": "1001000165",
+            "X-YP-Client-Id": "1001000003",
+            "Content-Type": "application/json",
+            "requestTime": str(int(time.time() * 1000)),
+            "User-Agent": BATTLE_UA,
+            "Origin": "https://panservice.mail.wo.cn",
+            "Referer": (
+                "https://panservice.mail.wo.cn/h5/activitymobile/campusSeason"
+                f"?activityId={quote(self.CAMPUS_ACTIVITY_ID)}&type=02"
+                f"&token={token}&clientid=1001000003"
+            ),
         }
 
-        async def api(method, path, **kw):
-            kw.setdefault("headers", act_headers)
-            return await self.req(method, f"https://panservice.mail.wo.cn{path}", **kw)
+    async def campus_signed_post(self, path, key, extra=None):
+        """取时间戳 -> 签名 -> 提交校园季活动接口"""
+        ts = await self.req(
+            "POST",
+            "https://panservice.mail.wo.cn/activity/getTimestamp",
+            headers=self.campus_headers(),
+            json={"key": key},
+        )
+        result = (ts.get("data") or {}).get("result") or {}
+        nonce, timestamp = result.get("nonce"), result.get("timestamp")
+        if not nonce or not timestamp:
+            self.tlog(f"getTimestamp 失败 {response_summary(ts)}")
+            return {}
+        body = {"activityId": self.CAMPUS_ACTIVITY_ID, **(extra or {})}
+        body["nonce"] = nonce
+        body["timestamp"] = timestamp
+        body["sign"] = self.cloud_activity_sign(body)
+        r = await self.req(
+            "POST",
+            f"https://panservice.mail.wo.cn{path}",
+            headers=self.campus_headers(),
+            json=body,
+        )
+        return r.get("data") or {}
 
-        async def get_ts(key):
-            d = await api("POST", "/activity/getTimestamp", json={"key": key})
-            data = d.get("data")
-            return data.get("result", {}) if isinstance(data, dict) else {}
-
-        def sign(params):
-            keys = sorted(params)
-            u = "&".join(
-                f"{k}={str(params[k]).strip()}"
-                for k in keys if str(params[k]).strip() != ""
+    async def campus_upload(self):
+        """上传 1 字节 1.txt 完成上传任务"""
+        token = self.cloud_disk_token()
+        content = b"1"
+        file_name = "1.txt"
+        file_info = {
+            "batchNo": datetime.now().strftime("%Y%m%d%H%M%S"),
+            "fileName": file_name,
+            "fileSize": len(content),
+            "fileType": 1,
+            "directoryId": "0",
+            "spaceType": "0",
+        }
+        form = {
+            "uniqueId": f"{int(time.time() * 1000)}_{random.randint(100000, 999999)}",
+            "accessToken": token,
+            "psToken": "",
+            "totalPart": "1",
+            "partSize": str(len(content)),
+            "partIndex": "1",
+            "channel": "wocloud",
+            "fileName": file_name,
+            "fileSize": str(len(content)),
+            "directoryId": "0",
+            "spaceType": "0",
+            "fileInfo": self.battle_encrypt_fileinfo(file_info, token),
+        }
+        headers = {
+            "User-Agent": BATTLE_UA,
+            "Referer": "https://panservice.mail.wo.cn/",
+            "accessToken": token,
+            "access-token": token,
+        }
+        try:
+            r = await self.client.post(
+                self.CAMPUS_UPLOAD_URL,
+                data=form,
+                files={"file": (file_name, content, "text/plain")},
+                headers=headers,
+                timeout=60.0,
             )
-            return hmac.new(CLOUD_PAN_SIGN_SECRET.encode(),
-                            (u + "&secret=" + CLOUD_PAN_SIGN_SECRET).encode(),
-                            hashlib.sha256).hexdigest()
-
-        # 活动状态
-        d = await api("GET", "/activity/checkActivityStatus",
-                      params={"activityId": SINGER_ACTIVITY_ID})
-        data = d.get("data")
-        if isinstance(data, dict) and (data.get("result") or {}).get("state") != 1:
-            self.tlog("活动未开启，跳过")
-            return
-
-        # ── UniClaw 体验（每日一次）──
-        try:
-            ts = await get_ts("activity:query:task2")
-            p = {"activityId": SINGER_ACTIVITY_ID, "nonce": ts.get("nonce", ""),
-                 "timestamp": ts.get("timestamp", "")}
-            p["sign"] = sign(p)
-            d = await api("POST", "/activity/aiRole/task2/query", json=p)
-            done = (d.get("data") or {}).get("result")
-            if done == 1:
-                self.tlog("UniClaw 今日已体验")
-            else:
-                ts = await get_ts("activity:acquire:task2")
-                p = {"activityId": SINGER_ACTIVITY_ID, "nonce": ts.get("nonce", ""),
-                     "timestamp": ts.get("timestamp", "")}
-                p["sign"] = sign(p)
-                d = await api("POST", "/activity/aiRole/task2", json=p)
-                meta = (d.get("data") or {}).get("meta") or {}
-                if str(meta.get("code")) == "200":
-                    self.tlog("UniClaw 体验完成 (许愿值+1 抽奖+1)")
-                else:
-                    self.tlog(f"UniClaw 上报失败: {json.dumps(d.get('data'), ensure_ascii=False)[:100]}")
+            try:
+                d = r.json()
+            except Exception:
+                d = {}
+            if d.get("code") == "0000":
+                return True, d.get("msg") or "上传成功"
+            return False, response_summary(d or {"text": r.text[:120]})
         except Exception as e:
-            self.tlog_exc(e, "UniClaw")
+            return False, str(e)[:120]
 
-        # ── AI 入戏制作（每日一次，避免浪费 faceCount）──
+    async def campus_task(self):
+        """校园季: 激活 -> 上传 -> 查进度 -> 自动抽奖"""
+        self._task_tag = "校园季"
+        if not self.cloud_disk_token():
+            self.tlog("缺少云盘 userToken, 跳过")
+            return
         try:
-            today = datetime.now().strftime("%Y-%m-%d")
-            d = await api("GET", "/activity/activity/task/info",
-                          params={"activityId": SINGER_ACTIVITY_ID})
-            logs = ((d.get("data") or {}).get("result") or {}).get("logs") or []
-            ai_done = any(
-                str(l.get("taskType")) == "6001"
-                and str(l.get("completionTime", "")).startswith(today)
-                for l in logs if isinstance(l, dict)
+            r = await self.req(
+                "POST",
+                "https://panservice.mail.wo.cn/activity/task/activate",
+                headers=self.campus_headers(),
+                json={"activityId": self.CAMPUS_ACTIVITY_ID},
             )
-            if ai_done:
-                self.tlog("AI入戏 今日已完成")
-            else:
-                await self._singer_ai_drama(api, sign)
-        except Exception as e:
-            self.tlog_exc(e, "AI入戏")
-
-        # ── 抽奖（抽完剩余次数）──
-        try:
-            for _ in range(5):
-                d = await api("GET", "/activity/lottery/lottery-times",
-                              params={"activityId": SINGER_ACTIVITY_ID})
-                times = (d.get("data") or {}).get("result", 0)
-                if not times or times <= 0:
-                    self.tlog("抽奖: 无剩余次数")
-                    return
-                ts = await get_ts("activity:lottery")
-                p = {"activityId": SINGER_ACTIVITY_ID, "nonce": ts.get("nonce", ""),
-                     "timestamp": ts.get("timestamp", "")}
-                p["sign"] = sign(p)
-                d = await api("POST", "/activity/lottery", json=p)
-                prize = (d.get("data") or {}).get("result") or {}
-                self.tlog(f"抽奖: {prize.get('prizeName') or prize}")
-                await asyncio.sleep(1)
-        except Exception as e:
-            self.tlog_exc(e, "抽奖")
-
-    async def _singer_ai_drama(self, api, sign):
-        # 云盘照片列表
-        d = await api("POST", "/wohome/knowledge/queryTypeFileList", json={
-            "pageSize": 20, "pageNo": 1, "suffixList": ["jpg", "jpeg", "png"],
-            "fileType": "1", "spaceType": 0, "sortRule": "0"})
-        data = d.get("data")
-        photos = ((data or {}).get("result") or {}).get("details") or []
-        if not photos:
-            self.tlog("AI入戏: 云盘无照片，跳过")
-            return
-        # 芒果换票（用完整活动 headers）
-        r = await api("POST", "/api-user/api/user/ticket", json={})
-        tmp = (r.get("data") or {}).get("result", {}).get("ticket")
-        if not tmp:
-            self.tlog("AI入戏: 换票失败")
-            return
-        r = await self.req("GET", "https://mgcact.api.mgtv.com/api/cu/login",
-                           params={"ticket": tmp, "t": str(int(time.time() * 1000))},
-                           headers={"referer": "https://panservice.mail.wo.cn/",
-                                    "user-agent": UA, "origin": "https://panservice.mail.wo.cn"})
-        m_ticket = (r.get("data") or {}).get("data", {}).get("ticket")
-        if not m_ticket:
-            self.tlog("AI入戏: 芒果登录失败")
-            return
-        mgt_headers = {"referer": "https://pop.mgtv.com/", "user-agent": UA,
-                       "origin": "https://pop.mgtv.com", "content-type": "application/json"}
-        # 遍历照片逐个尝试（需人像正面照）
-        for photo in photos:
-            fid = photo.get("fid") or ""
-            r = await self.req("POST", "https://mgcact.api.mgtv.com/api/cu/video/template/submit",
-                               json={"ticket": m_ticket, "t": str(int(time.time() * 1000)),
-                                     "templateId": SINGER_TEMPLATE_ID, "index": 0, "imgUrl": fid},
-                               headers=mgt_headers)
             d = r.get("data") or {}
-            task_id = (d.get("data") or {}).get("taskId")
-            if not task_id:
-                self.tlog(f"AI入戏: {photo.get('fileName')} 照片未通过识别，换下一张")
-                continue
-            self.tlog(f"AI入戏: 提交成功，等待审核 (照片={photo.get('fileName')})")
-            # 轮询审核状态（auditState=3 通过 = 任务完成）
-            for _ in range(6):
-                await asyncio.sleep(3)
-                r = await self.req("GET", "https://mgcact.api.mgtv.com/api/cu/video/template/result",
-                                   params={"ticket": m_ticket, "t": str(int(time.time() * 1000)),
-                                           "taskId": task_id},
-                                   headers={"referer": "https://pop.mgtv.com/",
-                                            "user-agent": UA, "origin": "https://pop.mgtv.com"})
-                rd = ((r.get("data") or {}).get("data") or {})
-                if rd.get("auditState") == 3:
-                    self.tlog("AI入戏 审核通过 (许愿值+1 抽奖+1)")
-                    return
-            self.tlog("AI入戏: 审核轮询结束（稍后可在作品列表查看）")
-            return
-        self.tlog("AI入戏: 所有照片均未通过识别")
+            if str((d.get("meta") or {}).get("code")) == "200":
+                self.tlog("激活成功")
+            else:
+                self.tlog(f"激活失败 {response_summary(d or r)}")
+                return
+
+            ok, msg = await self.campus_upload()
+            self.tlog(f"上传{'成功' if ok else '失败'}: {msg}")
+            if not ok:
+                return
+            await asyncio.sleep(3)
+
+            tl = await self.campus_signed_post(
+                "/activity/school/task/list", "activity:school:activate"
+            )
+            for t in (tl.get("result") or {}).get("taskList") or []:
+                if t.get("taskCode") == "30004":
+                    self.tlog(f"上传任务进度: {t.get('doneCount')}/{t.get('dailyLimit')}")
+
+            lt = await self.req(
+                "GET",
+                "https://panservice.mail.wo.cn/activity/lottery/lottery-times"
+                f"?activityId={self.CAMPUS_ACTIVITY_ID}",
+                headers=self.campus_headers(),
+            )
+            times = (lt.get("data") or {}).get("result")
+            times = times if isinstance(times, int) else 0
+            if times <= 0:
+                self.tlog("当前无可抽奖次数")
+                return
+            for _ in range(min(times, 5)):  # 上限保护: 防服务端异常次数导致长时间循环
+                res = await self.campus_signed_post("/activity/lottery", "activity:lottery")
+                if str((res.get("meta") or {}).get("code")) == "200":
+                    prize = (res.get("result") or {}).get("prizeName") or "未知奖品"
+                    self.tlog(f"抽奖成功: {prize}")
+                else:
+                    self.tlog(f"抽奖失败 {response_summary(res)}")
+                    break
+                await asyncio.sleep(1.5)
+        except Exception as e:
+            self.tlog(f"异常: {self.format_exc(e)}")
 
     # === 主任务 ===
     async def run(self):
@@ -4222,10 +4449,11 @@ class Unicom:
                 "ltzf": self.ltzf_task,
                 "sec": self.sec_task,
                 "farm": self.farm_task,
-                "cloud_battle": self.cloud_battle_task,
+                # "cloud_battle": self.cloud_battle_task,  # 上传大比拼已下线 (2026-08-06)
                 "shangdu": self.shangdu_task,
                 "uphone": self.uphone_task,
-                "singer": self.singer_task,
+                "woread": self.woread_task,
+                "campus": self.campus_task,
             }
             if only:
                 names = [n.strip() for n in only.split(",") if n.strip()]
@@ -4242,10 +4470,11 @@ class Unicom:
                     self.ltzf_task,
                     self.sec_task,
                     self.farm_task,
-                    self.cloud_battle_task,
+                    # self.cloud_battle_task,  # 上传大比拼已下线 (2026-08-06)
                     self.shangdu_task,
                     self.uphone_task,
-                    self.singer_task,
+                    self.woread_task,
+                    self.campus_task,
                 ]
             # 服务端长期不可用的模块（如 wocare 接口整体 5xx）可用环境变量停掉，
             # 避免每次运行都产生注定失败的异常并淹没推送
