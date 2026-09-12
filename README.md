@@ -22,13 +22,13 @@ cu.py
 | 权益超市 | `market_task` | |
 | 签到区 | `sign_task` | |
 | 新疆联通 | `xj_task` | 按归属地跳过 |
-| 天天领现金 | `ttlxj_task` | |
 | 联通祝福 | `ltzf_task` | |
 | 安全管家 | `sec_task` | |
 | 通通乡村 | `farm_task` | |
-| 上传大比拼 | `cloud_battle_task` | 需云盘 token |
 | 商都福利 | `shangdu_task` | 按归属地跳过 |
 | 云手机积分 | `uphone_task` | 见下方说明 |
+| 沃阅读积分 | `woread_task` | 每账号自动换票 |
+| 校园季 | `campus_task` | 上传 / 转存 / AI 对话 / 抽奖，需云盘 token |
 
 ### 云手机（`uphone_task`）
 
@@ -40,6 +40,15 @@ cu.py
 4. **赚积分任务**（`Points_Obtain_2507`）：可 API 完成的任务自动上报并领取；讨论区、看广告等需真机行为的任务跳过
 5. **积分十连**：余额 ≥ 阈值且当日仍有次数时执行（默认满 100 分）
 6. **夏日刮一刮**（`HD2026062200218`）：仅领 `2508-01` 换 1 次次数，有次数则抽完
+
+### 校园季（`campus_task`）
+
+1. **激活**后先查任务状态：已满的任务自动跳过，避免重复副作用
+2. **上传**占位文件 + **AI 学习助手对话**（SSE 流式，独立新会话）
+3. **转存教育/娱乐内容**：依次尝试校园 tab 候选 → 芒果TV 内容源
+   （需芒果会员，无权益秒退）→ mbh 影视/教育频道（不限会员），
+   内容池耗尽自动切换，已转存过的内容自动跳过
+4. **自动抽奖**（次数本地硬上限保护）
 
 ## 快速开始
 
@@ -74,15 +83,15 @@ python cu.py
 | `UNICOM_TTXC_GARBAGE_WAIT` | `28` | 农场垃圾任务等待秒数 |
 | `UNICOM_TTXC_GROW_MAX_CHARGE_PER_LAND` | `20` | 单地块最大充能次数 |
 | `UNICOM_TTXC_HARVEST_WAIT` | `3` | 收获等待秒数 |
-| `UNICOM_CLOUD_BATTLE_FILE` | `文本.txt` | 上传文件名 |
-| `UNICOM_CLOUD_BATTLE_CONTENT` | `1` | 上传文件内容 |
+| `UNICOM_CAMPUS_EDU_ID` | 见源码 | 校园季教育转存兑底内容 ID |
+| `UNICOM_CAMPUS_ENT_ID` | 见源码 | 校园季娱乐转存兑底内容 ID |
 | `SHANGDU_LOTTERY_MAX` | 剩余次数 | 单次最多抽奖次数 |
 | `UNICOM_UPHONE_LOTTERY_COST` | `100` | 云手机积分十连触发余额阈值 |
 
 ## 说明
 
 - 默认关闭 HTTP/2，使用 HTTP/1.1
-- 日志中对手机号等信息做脱敏处理
+- 日志中对手机号、token、ticket 等敏感信息做脱敏处理
 - 请勿将 token、密钥等敏感信息提交到公开仓库
 
 ## 免责声明

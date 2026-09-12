@@ -16,8 +16,8 @@ from datetime import datetime
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 import httpx
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
+from Crypto.Cipher import AES, DES
+from Crypto.Util.Padding import pad, unpad
 from gmssl import sm2
 
 
@@ -81,16 +81,48 @@ TTXC_NEWBIE_STEPS = [
 # 云盘活动签名密钥（上传大比拼等 panservice 活动共用）
 CLOUD_PAN_SIGN_SECRET = "s8Hf3LqP9xN2vM5bR7tY1wZ4cA6eG0K"
 
-CLOUD_BATTLE_ACTIVITY_ID = "MzA="
-CLOUD_BATTLE_TOUCHPOINT = "300200030001"
-CLOUD_BATTLE_UPLOAD_URL = "https://tjupload.pan.wo.cn/openapi/client/upload2C"
 BATTLE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko)  unicom{version:iphone_c@12.1300};ltst;OSVersion/27.0"
 )
 CLOUD_BATTLE_FILEINFO_IV = "wNSOYIB1k1DjY5lA"
-CLOUD_BATTLE_FILE_NAME = os.environ.get("UNICOM_CLOUD_BATTLE_FILE", "文本.txt")
-CLOUD_BATTLE_FILE_CONTENT = os.environ.get("UNICOM_CLOUD_BATTLE_CONTENT", "1")
+
+# 沃视频(5G宽视界)内容转存：密钥逆向自 YunPanVideoV4 前端 chunk
+WO_VIDEO_BASE = "https://mbh.chinaunicomvideo.cn"
+WO_VIDEO_CHANNEL = "1001000218"
+WO_TRANSFER_DES_KEY = "LsgFQAYhXkjpqB7K"
+WO_TRANSFER_AES_KEY = "9b54bfce4b4b4719"
+WO_TRANSFER_AES_IV = "wNSOYIB1k1DjY5lA"
+# 校园季转存兜底内容（正常路径从校园 tab 动态发现，兜底 id 抓包验证可用）
+CAMPUS_EDU_FALLBACK_ID = os.environ.get(
+    "UNICOM_CAMPUS_EDU_ID", "0132429091704a6297fef31c7a6e2c5e"
+)
+CAMPUS_ENT_FALLBACK_ID = os.environ.get(
+    "UNICOM_CAMPUS_ENT_ID", "746e403f3b6348328d3c954edf3fd06e"
+)
+CAMPUS_FALLBACK_NAME = {
+    "edu": "考研数学概率论与数理统计第1集",
+    "ent": "寒战1994粤语版",
+}
+
+
+def wo_des_b64(text, key=WO_TRANSFER_DES_KEY):
+    """沃视频 DES-CBC（key 取前 8 字节，iv=0x01..0x08，Pkcs7）→ base64。"""
+    cipher = DES.new(key.encode()[:8], DES.MODE_CBC, bytes(range(1, 9)))
+    return base64.b64encode(cipher.encrypt(pad(text.encode(), 8))).decode()
+
+
+def wo_aes_b64(text, key=WO_TRANSFER_AES_KEY):
+    """沃视频 AES-CBC（固定 IV，Pkcs7）→ base64。"""
+    cipher = AES.new(key.encode(), AES.MODE_CBC, WO_TRANSFER_AES_IV.encode())
+    return base64.b64encode(cipher.encrypt(pad(text.encode(), 16))).decode()
+
+
+def wo_aes_unb64(data, key=WO_TRANSFER_AES_KEY):
+    """沃视频 AES-CBC 解密（JudgeFileTransferStatus 响应 DATA）。"""
+    cipher = AES.new(key.encode(), AES.MODE_CBC, WO_TRANSFER_AES_IV.encode())
+    return unpad(cipher.decrypt(base64.b64decode(data)), 16).decode()
+
 
 SHANGDU_BASE = "https://app.shangdu.com"
 SHANGDU_ENTRY = f"{SHANGDU_BASE}/monthlyBenefit/static/index.html"
@@ -121,7 +153,6 @@ UPHONE_CHANNEL = "ST-Wode"
 UPHONE_CHANNEL_H5 = "ST-Jingang002"
 UPHONE_EDOP_APP_ID = "edop_unicom_68e8fa69"
 
-# 歌手2026活动
 UPHONE_ACT_SIGN = "Points_Sign_2507"
 UPHONE_ACT_OBTAIN = "Points_Obtain_2507"
 UPHONE_ACT_EXCHANGE = "Points_Exchange_2507"  # 2508 无效; 2507 列表无十连商品(2026031010) → 十连暂不可用
@@ -168,6 +199,18 @@ def safe_int(value, default=0):
         return default
 
 
+_REDACT_FIELD_RE = re.compile(
+    r'(["\']?(token|ticket|cookie|verifycode|accesstoken|tokenid|authinfo|sessionid|'
+    r'authorization|access[-_]?token|secret)["\']?\s*[:=]\s*)(["\']?)[^"\',}&\s]+\3',
+    re.IGNORECASE,
+)
+
+
+def redact_text(text):
+    """JSON/表单风格文本中的凭据字段打码（认证材料不入持久日志）。"""
+    return _REDACT_FIELD_RE.sub(r"\1\3***\3", str(text))
+
+
 def response_summary(res):
     if isinstance(res, dict):
         meta = res.get("meta") or {}
@@ -175,7 +218,7 @@ def response_summary(res):
             return str(meta.get("message"))
         if res.get("msg"):
             return str(res.get("msg"))
-    return str(res)[:120]
+    return redact_text(res)[:120]
 
 
 def format_exception_detail(e, action=None):
@@ -230,11 +273,11 @@ def api_response_err(r, action=None):
             if v not in (None, "", {}):
                 parts.append(f"{k}={v}")
         if len(parts) == (1 if action else 0):
-            parts.append(f"body={str(data)[:150]}")
+            parts.append(f"body={redact_text(data)[:150]}")
     elif data is not None:
         text = str(data).strip()
         if text:
-            parts.append(f"body={text[:150]}")
+            parts.append(f"body={redact_text(text)[:150]}")
     elif http in (200, 201):
         parts.append("响应体为空")
     return " | ".join(parts)
@@ -307,12 +350,10 @@ class Unicom:
         self.market_token = self.market_login_id = self.market_cycle_start_time = ""
         self.xj_token = self.wocare_token = self.wocare_sid = ""
         self.sec_ticket = self.sec_token = self.sec_jea_id = self.sec_key = ""
-        self.session_id = self.token_id = self.rpt_id = ""
         self.ttxc_token = self.ttxc_nick_name = self.ttxc_user_id = ""
         self.ttxc_newbie_list = []
         self.ttxc_charge_level = {}
         self.ttxc_no_energy = False
-        self.battle_page_referer = ""
         self.last_ticket_url = ""
         self.uphone_cp_token = self.uphone_usr_token = self.uphone_device_id = ""
 
@@ -933,7 +974,11 @@ class Unicom:
                 return None
             if act.get("activityCode") == "YOUCHOICEONE":
                 return act
-        return data[0]
+        self.tlog(
+            "优享权益: 未找到 YOUCHOICEONE 活动, 不领取兜底第一项 "
+            f"(共 {len(data)} 项: {[str(a.get('activityCode')) for a in data][:5]})"
+        )
+        return None
 
     def market_build_try_order(self, detail_list):
         """优先当日惊喜[0]；其后按 n-1..1 倒序尝试基础权益，跳过 status=3。
@@ -998,8 +1043,6 @@ class Unicom:
         if times <= 0:
             if cycle == "WEEK" and status == 2:
                 return "本周已领取过该权益"
-            return "今天已经抢过啦"
-        if times <= 0 and left <= 0:
             return "今天已经抢过啦"
         if times > 0 and status == 2 and left > 0 and cycle == "WEEK":
             return "本周已领取过该权益"
@@ -1287,7 +1330,7 @@ class Unicom:
             count = require_int(res.get("data"), "raffleCount", minimum=0)
             self.tlog(f"抽奖次数: {count}")
 
-            for _ in range(count):
+            for _ in range(min(count, 10)):  # 服务端次数硬上限, 防异常值失控
                 await asyncio.sleep(2)
                 ts = int(time.time() * 1000)
                 r = await self.req(
@@ -1317,236 +1360,7 @@ class Unicom:
             await self.market_privilege()
             await self.market_raffle()
 
-    # === 3. 天天领现金 ===
-    TTLXJ_PAGE = (
-        "https://epay.10010.com/ci-mcss-party-web/clockIn/"
-        "?bizFrom=225&bizChannelCode=225&channelType=QBSZ"
-    )
-
-    def ttlxj_bizinfo(self):
-        """party 域接口的鉴权头。
-
-        除 bizChannelInfo 外，业务接口还必须带 auth/check 换回的 authInfo + tokenid，
-        否则服务端回 11019006 这类 popup 拒绝信封（无业务数据）。
-        """
-        ref = self.TTLXJ_PAGE + (f"&rptid={self.rpt_id}" if self.rpt_id else "")
-        h = {
-            "bizchannelinfo": json.dumps(
-                {
-                    "bizChannelCode": "225",
-                    "disriBiz": "party",
-                    "unionSessionId": "",
-                    "stType": "",
-                    "stDesmobile": "",
-                    "source": "",
-                    "rptId": self.rpt_id,
-                    "ticket": "",
-                    "tongdunTokenId": "",
-                    "xindunTokenId": "",
-                }
-            ),
-            "Referer": ref,
-            "Origin": "https://epay.10010.com",
-            "Accept": "application/json, text/plain, */*",
-            "X-Requested-With": "XMLHttpRequest",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        }
-        if self.token_id:
-            h["tokenid"] = self.token_id
-            h["authInfo"] = json.dumps(
-                {
-                    "accessToken": None,
-                    "mobile": "",
-                    "sessionId": self.session_id or self.token_id,
-                    "stOpenDate": None,
-                    "tokenId": self.token_id,
-                    "userId": "",
-                }
-            )
-        return h
-
-    async def ttlxj_task(self):
-        self._task_tag = "天天领现金"
-        self.tlog("开始")
-        ticket_info = await self.get_ticket(
-            "https://epay.10010.com/ci-mps-st-web/?webViewNavIsHidden=webViewNavIsHidden"
-        )
-        if not ticket_info:
-            self.tlog("获取ticket失败")
-            return
-
-        # 先载入带 ticket 的落地页，再以它作 Referer 换 rptid；
-        # 缺 Referer 时 authorize 返回 HTTP 200 但体内 status=400 bad referer
-        st_referer = self.last_ticket_url or (
-            "https://epay.10010.com/ci-mps-st-web/?webViewNavIsHidden=webViewNavIsHidden"
-        )
-        await self.req("GET", st_referer)
-
-        # 授权
-        r = await self.req(
-            "POST",
-            "https://epay.10010.com/woauth2/v2/authorize",
-            headers={
-                "Referer": st_referer,
-                "Origin": "https://epay.10010.com",
-                "Accept": "application/json",
-            },
-            json={
-                "response_type": "rptid",
-                "client_id": "73b138fd-250c-4126-94e2-48cbcc8b9cbe",
-                "redirect_uri": "https://epay.10010.com/ci-mps-st-web/",
-                "login_hint": {
-                    "credential_type": "st_ticket",
-                    "credential": ticket_info,
-                    "st_type": "02",
-                    "force_logout": True,
-                    "source": "app_sjyyt",
-                },
-                "device_info": {
-                    "token_id": f"chinaunicom-pro-{int(time.time() * 1000)}-{''.join(random.choices(string.ascii_letters + string.digits, k=13))}",
-                    "trace_id": "".join(
-                        random.choices(string.ascii_letters + string.digits, k=32)
-                    ),
-                },
-            },
-        )
-        # authorize 失败时 HTTP 仍为 200，判据在响应体的 status/rptid
-        auth_res = r["data"] if isinstance(r["data"], dict) else {}
-        if r["code"] != 200 or safe_int(auth_res.get("status"), -1) != 200:
-            self.tlog(
-                f"授权失败: {auth_res.get('message') or auth_res.get('ext_code') or ''} "
-                f"{api_response_err(r, 'authorize')}"
-            )
-            return
-        # 注意：authorize 返回的 rptid 属于 ci-mps-st-web 客户端，拿去 party 域
-        # 会被判 invalid audience；clockIn 用的 rptid 要走下面的 woauth2/login 重定向拿。
-        # 这里 authorize 的作用只是建立 woauth2 会话 cookie。
-
-        # 先加载活动页，让服务端把 clockIn 作为 referWoauthUrl 写进会话，
-        # 否则下一步 auth/check 返回的 woauth_login_url 不带 redirect_url
-        await self.req("GET", self.TTLXJ_PAGE)
-
-        # 认证检查
-        r = await self.req(
-            "POST",
-            "https://epay.10010.com/ps-pafs-auth-front/v1/auth/check",
-            headers=self.ttlxj_bizinfo(),
-            json={},
-        )
-
-        res = r["data"]
-        if not isinstance(res, dict):
-            self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
-            return
-        if str(res.get("code")) == "0000":
-            data = res.get("data")
-            auth = data.get("authInfo") if isinstance(data, dict) else None
-            if not isinstance(auth, dict):
-                self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
-                return
-            self.session_id, self.token_id = (
-                auth.get("sessionId"),
-                auth.get("tokenId"),
-            )
-        elif str(res.get("code")) == "2101000100":
-            # 需要登录获取rptId
-            data = res.get("data")
-            if not isinstance(data, dict):
-                self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
-                return
-            login_url = data.get("woauth_login_url")
-            if login_url:
-                # 服务端通常已把 redirect_url 填好；只有留空时才由我们补上活动页，
-                # 否则直接拼接会污染已编码的 redirect_url 参数
-                full_url = (
-                    f"{login_url}{quote(self.TTLXJ_PAGE, safe='')}"
-                    if login_url.endswith("redirect_url=")
-                    else login_url
-                )
-                r = await self.req("GET", full_url, allow_redirects=False)
-                if loc := r["headers"].get("location") or r["headers"].get("Location"):
-                    if rptid := parse_qs(urlparse(loc).query).get("rptid", [""])[0]:
-                        self.rpt_id = rptid
-                        # 重新认证
-                        r = await self.req(
-                            "POST",
-                            "https://epay.10010.com/ps-pafs-auth-front/v1/auth/check",
-                            headers=self.ttlxj_bizinfo(),
-                            json={},
-                        )
-                        res = r["data"]
-                        if not isinstance(res, dict) or str(res.get("code")) != "0000":
-                            self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
-                            return
-                        data = res.get("data")
-                        auth = data.get("authInfo") if isinstance(data, dict) else None
-                        if not isinstance(auth, dict):
-                            self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
-                            return
-                        self.session_id, self.token_id = (
-                            auth.get("sessionId"),
-                            auth.get("tokenId"),
-                        )
-                    else:
-                        self.tlog("登录重定向缺少rptid")
-                        return
-                else:
-                    self.tlog(f"登录重定向缺少Location: {api_response_err(r, 'woauth2/login')}")
-                    return
-            else:
-                self.tlog("认证响应缺少woauth_login_url")
-                return
-        else:
-            self.tlog(f"认证失败: {api_response_err(r, 'auth/check')}")
-            return
-
-        # 查询打卡状态
-        r = await self.req(
-            "POST",
-            "https://epay.10010.com/ci-mcss-party-front/v1/ttlxj/userDrawInfo",
-            headers=self.ttlxj_bizinfo(),
-        )
-        if (res := r["data"]) and str(res.get("code")) == "0000":
-            data = res.get("data", {})
-            # 会话无效时服务端回的是 popup 拒绝信封（无 day 日历字段），须先识别
-            if str(data.get("returnCode")) != "0":
-                self.tlog(
-                    f"查询打卡状态被拒[{data.get('returnCode')}]: "
-                    f"{data.get('returnMsg') or json.dumps(data, ensure_ascii=False)[:150]}"
-                )
-                return
-            day_key = f"day{data.get('dayOfWeek')}"
-            if data.get(day_key) == "1":
-                draw_type = "C" if (datetime.now().weekday() + 1) % 7 == 0 else "B"
-                r = await self.req(
-                    "POST",
-                    "https://epay.10010.com/ci-mcss-party-front/v1/ttlxj/unifyDrawNew",
-                    headers=self.ttlxj_bizinfo(),
-                    data={
-                        "drawType": draw_type,
-                        "bizFrom": "225",
-                        "activityId": "TTLXJ20210330",
-                    },
-                )
-                if (
-                    (res := r["data"])
-                    and str(res.get("code")) == "0000"
-                    and str(res.get("data", {}).get("returnCode")) == "0"
-                ):
-                    amt = res["data"].get("amount")
-                    self.tlog(
-                        f"{res['data'].get('awardTipContent', '').replace('xx', str(amt))}"
-                    )
-                else:
-                    self.tlog(f"抽奖失败: {api_response_err(r, 'unifyDrawNew')}")
-            else:
-                # 实测：可抽时 day{dayOfWeek}=="1"，抽完即翻为 "0"
-                self.tlog(
-                    f"今日已抽过 {day_key}={data.get(day_key)!r} "
-                    f"周内已抽={data.get('weekDrawTimes')} 累计={data.get('countAmount')}元"
-                )
-
-    # === 4. 联通祝福 ===
+    # === 3. 联通祝福 ===
     def wocare_decode(self, result):
         """解码wocare响应的messageContent字段"""
         if not isinstance(result, dict) or "messageContent" not in result:
@@ -1735,7 +1549,7 @@ class Unicom:
                                 self.tlog(f"{activity.get('name', '')}: 可抽奖{count}次")
                                 # 执行抽奖；触发"频繁"风控时该次不计数，重试同一次
                                 done = retry = 0
-                                while done < count:
+                                while done < min(count, 10) and retry < 30:  # 双重硬上限
                                     await asyncio.sleep(random.uniform(3, 5))
                                     res = await self.wocare_post(
                                         "luckDraw",
@@ -1797,7 +1611,7 @@ class Unicom:
         else:
             self.tlog(f"获取sid失败: {api_response_err(r, 'getToken')}")
 
-    # === 5. 新疆联通 ===
+    # === 4. 新疆联通 ===
     async def xj_task(self):
         self._task_tag = "新疆联通"
         if "新疆" not in self.province:
@@ -1965,7 +1779,7 @@ class Unicom:
                 else:
                     self.tlog(f"每日打卡{idx}: {data or msg}")
 
-    # === 6. 安全管家 ===
+    # === 5. 安全管家 ===
     async def sec_task(self):
         self._task_tag = "安全管家"
         self.tlog("开始")
@@ -2096,9 +1910,8 @@ class Unicom:
 
         # 注: 代接/号段拦截/黑名单等操作任务需真机微信小程序(瑞数设备指纹), VPS无法完成
         #     仅签到可自动化 (2026-08-08 实测确认)
-        self.tlog("签到完成")
 
-    # === 7. 通通农场（通通乡村）===
+    # === 6. 通通农场（通通乡村）===
     def ttxc_headers(self, auth=True, ecs=False):
         headers = {
             "User-Agent": TTXC_UA,
@@ -2245,9 +2058,11 @@ class Unicom:
 
     def ttxc_newbie_done(self):
         steps = getattr(self, "ttxc_newbie_list", None)
-        return not isinstance(steps, list) or all(
-            step in steps for step in TTXC_NEWBIE_STEPS
-        )
+        if not isinstance(steps, list):
+            # 接口改版/畸形响应: 维持跳过新手任务的现行为, 但留痕便于排查
+            self.tlog(f"新手任务列表异常({type(steps).__name__}), 按已完成处理")
+            return True
+        return all(step in steps for step in TTXC_NEWBIE_STEPS)
 
     async def ttxc_newbie_mark(self, step):
         target = []
@@ -2782,7 +2597,7 @@ class Unicom:
         tasks = await self.ttxc_get_tasks()
         await self.ttxc_claim_ready_tasks(tasks, claimed)
 
-    # === 8. 商都福利 ===
+    # === 7. 商都福利 ===
     def shangdu_token(self):
         """获取 app.shangdu.com 下发的 token cookie"""
         for c in self.client.cookies.jar:
@@ -3108,105 +2923,7 @@ class Unicom:
             CLOUD_PAN_SIGN_SECRET.encode(), raw.encode(), hashlib.sha256
         ).hexdigest()
 
-    # === 9. 云盘上传大比拼===
-
-    def battle_log(self, msg):
-        self.task_log("上传大比拼", msg)
-
-    def battle_log_exc(self, e, action=None):
-        self.battle_log(f"异常: {self.format_exc(e, action)}")
-
-    def battle_referer(self):
-        if self.battle_page_referer:
-            return self.battle_page_referer
-        token = self.cloud_disk_token()
-        return (
-            f"https://panservice.mail.wo.cn/h5/activitymobile/cloudBattle"
-            f"?activityId={quote(CLOUD_BATTLE_ACTIVITY_ID)}&touchpoint={CLOUD_BATTLE_TOUCHPOINT}&token={token}"
-        )
-
-    async def battle_enter(self):
-        """进入活动页，刷新 token 并获取带 ticket 的 Referer（lottery-times 必需）"""
-        token = self.cloud_disk_token()
-        if not token:
-            return False
-        entry = (
-            f"https://panservice.mail.wo.cn/h5/activitymobile/cloudBattle"
-            f"?activityId={quote(CLOUD_BATTLE_ACTIVITY_ID)}&touchpoint={CLOUD_BATTLE_TOUCHPOINT}"
-            f"&clientid=1001000003&token={token}"
-        )
-        r = await self.req(
-            "GET",
-            "https://m.client.10010.com/mobileService/openPlatform/openPlatLineNew.htm",
-            params={"to_url": entry},
-            allow_redirects=False,
-        )
-        url = r["headers"].get("location") or r["headers"].get("Location")
-        if not url:
-            return False
-        for _ in range(4):
-            if url.startswith("/"):
-                url = urljoin("https://panservice.mail.wo.cn", url)
-            self.battle_page_referer = url.split("#", 1)[0]
-            q = parse_qs(urlparse(url).query)
-            new_token = (q.get("token") or [""])[0]
-            if new_token:
-                self.cloud_disk = {"userToken": new_token}
-            if "ticket=" in url:
-                return True
-            r = await self.req("GET", url, allow_redirects=False)
-            nxt = r["headers"].get("location") or r["headers"].get("Location")
-            if not nxt or nxt == url:
-                return "ticket=" in url
-            url = nxt
-        return False
-
-    def battle_headers(self, client_id="1001000003", extra=None):
-        token = self.cloud_disk_token()
-        if not token:
-            return {}
-        headers = {
-            "X-YP-Access-Token": token,
-            "Accept": "application/json, text/plain, */*",
-            "source-type": "woapi",
-            "requestTime": str(int(time.time() * 1000)),
-            "User-Agent": BATTLE_UA,
-            "clientId": "1001000165",
-            "X-SH-Access-Token": "",
-            "X-YP-GRAY-FLAG": "undefined",
-            "Content-Type": "application/json",
-            "X-YP-Client-Id": client_id,
-            "token": token,
-            "Origin": "https://panservice.mail.wo.cn",
-            "Referer": self.battle_referer(),
-        }
-        if extra:
-            headers.update(extra)
-        return headers
-
-    async def battle_post(self, path, payload=None, client_id="1001000003", extra=None):
-        headers = self.battle_headers(client_id, extra)
-        if not headers:
-            return {}
-        r = await self.req(
-            "POST",
-            f"https://panservice.mail.wo.cn{path}",
-            headers=headers,
-            json=payload or {},
-        )
-        return require_dict_data(r, path)
-
-    async def battle_get(self, path, params=None, client_id="1001000003", extra=None):
-        headers = self.battle_headers(client_id, extra)
-        if not headers:
-            return {}
-        r = await self.req(
-            "GET",
-            f"https://panservice.mail.wo.cn{path}",
-            headers=headers,
-            params=params or {},
-        )
-        return require_dict_data(r, path)
+    # --- 校园季上传复用: 文件信息加密(源自上传大比拼协议, 该活动已下线) ---
 
     def battle_encrypt_fileinfo(self, info, token):
         key = token[:16].encode()
@@ -3217,290 +2934,7 @@ class Unicom:
             cipher.encrypt(pad(plaintext.encode(), AES.block_size))
         ).decode()
 
-    async def battle_signed_post(
-        self, path, key, payload=None, client_id="1001000003", extra=None
-    ):
-        ts = await self.battle_post(
-            "/activity/getTimestamp", {"key": key}, client_id, extra
-        )
-        result = ts.get("result") or {}
-        nonce = result.get("nonce")
-        timestamp = result.get("timestamp")
-        if not nonce or not timestamp:
-            self.battle_log(f"getTimestamp失败 {response_summary(ts)}")
-            return {}
-        body = dict(payload or {})
-        body.update(
-            {
-                "activityId": CLOUD_BATTLE_ACTIVITY_ID,
-                "nonce": nonce,
-                "timestamp": timestamp,
-            }
-        )
-        body["sign"] = self.cloud_activity_sign(body)
-        return await self.battle_post(path, body, client_id, extra)
-
-    async def battle_check_opened(self):
-        """返回 True/False 表示是否已开启；None 表示查询失败。"""
-        data = await self.battle_get(
-            "/activity/checkActivityStatus", {"activityId": CLOUD_BATTLE_ACTIVITY_ID}
-        )
-        meta = data.get("meta") or {}
-        if str(meta.get("code")) != "200":
-            self.battle_log(f"查询开启状态失败 {response_summary(data)}")
-            return None
-        result = data.get("result")
-        if not isinstance(result, dict) or "state" not in result:
-            self.battle_log(f"查询开启状态失败 {response_summary(data)}")
-            return None
-        try:
-            state = require_int(result["state"], "checkActivityStatus.state")
-        except ValueError:
-            self.battle_log(f"查询开启状态失败 {response_summary(data)}")
-            return None
-        if state not in (0, 1):
-            self.battle_log(f"查询开启状态失败 {response_summary(data)}")
-            return None
-        return state == 1
-
-    async def battle_open_activity(self):
-        if not self.province or not self.province_code:
-            self.battle_log("缺少省份信息，无法开启冲榜")
-            return False
-        data = await self.battle_post(
-            "/activity/openActivity",
-            {
-                "activityId": CLOUD_BATTLE_ACTIVITY_ID,
-                "provinceCode": self.province_code,
-                "provinceName": self.province,
-            },
-        )
-        meta = data.get("meta") or {}
-        if (
-            str(meta.get("code")) == "200"
-            and safe_int((data.get("result") or {}).get("state")) == 1
-        ):
-            self.battle_log(f"开启冲榜成功 {self.province}")
-            return True
-        self.battle_log(f"开启冲榜失败 {meta.get('message') or response_summary(data)}")
-        return False
-
-    async def battle_lottery_times(self):
-        """返回 (次数, data)；次数为 None 表示查询失败。"""
-        data = await self.battle_get(
-            "/activity/lottery/lottery-times", {"activityId": CLOUD_BATTLE_ACTIVITY_ID}
-        )
-        meta = data.get("meta") or {}
-        if str(meta.get("code")) != "200":
-            self.battle_log(f"查询抽奖次数失败 {response_summary(data)}")
-            return None, data
-        result = data.get("result")
-        try:
-            times = require_int(result, "lotteryTimes", minimum=0)
-        except ValueError:
-            self.battle_log(f"查询抽奖次数失败 {response_summary(data)}")
-            return None, data
-        return times, data
-
-    def battle_drawn_today(self, records):
-        today = datetime.now().date()
-        for item in records or []:
-            if not isinstance(item, dict):
-                continue
-            create_time = item.get("createTime") or ""
-            try:
-                if datetime.strptime(create_time[:10], "%Y-%m-%d").date() == today:
-                    return True
-            except ValueError:
-                continue
-        return False
-
-    async def battle_upload_file(self):
-        token = self.cloud_disk_token()
-        if not token:
-            return False
-        content = CLOUD_BATTLE_FILE_CONTENT.encode("utf-8")
-        file_name = CLOUD_BATTLE_FILE_NAME
-        file_info = {
-            "batchNo": datetime.now().strftime("%Y%m%d%H%M%S"),
-            "fileName": file_name,
-            "fileSize": len(content),
-            "fileType": 1,
-            "directoryId": "0",
-            "spaceType": "0",
-        }
-        form = {
-            "uniqueId": f"{int(time.time() * 1000)}_{random.randint(100000, 999999)}",
-            "accessToken": token,
-            "psToken": "",
-            "totalPart": "1",
-            "partSize": str(len(content)),
-            "partIndex": "1",
-            "channel": "wocloud",
-            "fileName": file_name,
-            "fileSize": str(len(content)),
-            "directoryId": "0",
-            "spaceType": "0",
-            "fileInfo": self.battle_encrypt_fileinfo(file_info, token),
-        }
-        headers = {
-            "User-Agent": BATTLE_UA,
-            "Referer": self.battle_referer(),
-            "accessToken": token,
-            "access-token": token,
-        }
-        try:
-            r = await self.client.post(
-                CLOUD_BATTLE_UPLOAD_URL,
-                data=form,
-                files={"file": (file_name, content, "text/plain")},
-                headers=headers,
-                timeout=60.0,
-            )
-            data = (
-                r.json() if r.text.strip().startswith("{") else {"text": r.text[:200]}
-            )
-        except Exception as e:
-            self.battle_log(f"上传异常: {self.format_exc(e, 'upload2C')}")
-            return False
-        if str(data.get("code")) == "0000":
-            raw_data = data.get("data")
-            if not isinstance(raw_data, dict):
-                self.battle_log(
-                    f"上传失败 {data.get('msg') or response_summary(data)}"
-                )
-                return False
-            fid = raw_data.get("fid", "")
-            self.battle_log(
-                f"上传成功 {file_name} ({len(content)}B) fid={str(fid)[:24]}..."
-            )
-            return True
-        self.battle_log(f"上传失败 {data.get('msg') or response_summary(data)}")
-        return False
-
-    async def battle_wait_lottery_times(self, max_wait=8):
-        """轮询抽奖次数；返回次数，None 表示查询失败，0 表示合法无次数。"""
-        for i in range(max_wait):
-            if i:
-                await asyncio.sleep(1)
-            count, _ = await self.battle_lottery_times()
-            if count is None:
-                return None
-            if count > 0:
-                self.battle_log(f"抽奖次数 {count}")
-                return count
-        self.battle_log("上传后未获得抽奖次数")
-        return 0
-
-    async def battle_province_ranking(self):
-        data = await self.battle_signed_post(
-            "/activity/file/upload/battle/provinceRanking",
-            "activity:file:upload:battle:rank",
-            {"topN": 34},
-        )
-        meta = data.get("meta") or {}
-        if str(meta.get("code")) != "200":
-            self.battle_log(
-                f"省份排名查询失败 {meta.get('message') or response_summary(data)}"
-            )
-            return False
-        return True
-
-    async def battle_draw_lottery(self):
-        prize = await self.battle_signed_post("/activity/lottery", "activity:lottery")
-        meta = prize.get("meta") or {}
-        if str(meta.get("code")) != "200":
-            self.battle_log(
-                f"抽奖失败 {meta.get('message') or response_summary(prize)}"
-            )
-            return False
-        result = prize.get("result") or {}
-        prize_name = result.get("prizeName") or response_summary(prize)
-        self.battle_log(f"抽奖成功 {prize_name}")
-        return True
-
-    async def cloud_battle_task(self):
-        """上传大比拼：进入活动 -> 开启冲榜 -> 上传文件 -> 抽奖"""
-        if not self.cloud_disk_token():
-            return
-        self._task_tag = "上传大比拼"
-        self.battle_log("开始")
-        if not await self.battle_enter():
-            self.battle_log("进入活动页失败")
-            return
-
-        status = await self.battle_get(
-            "/activity/activity-status", {"activityId": CLOUD_BATTLE_ACTIVITY_ID}
-        )
-        if str((status.get("meta") or {}).get("code")) != "200":
-            self.battle_log(f"查询活动状态失败 {response_summary(status)}")
-            return
-        status_result = status.get("result")
-        if not isinstance(status_result, dict) or "activityStatus" not in status_result:
-            self.battle_log(
-                f"查询活动状态失败 响应缺少activityStatus {response_summary(status)}"
-            )
-            return
-        try:
-            activity_status = require_int(
-                status_result.get("activityStatus"), "activityStatus"
-            )
-        except ValueError:
-            self.battle_log(
-                f"查询活动状态失败 activityStatus非法 {response_summary(status)}"
-            )
-            return
-        if activity_status != 1:
-            self.battle_log("活动未上线或已结束")
-            return
-
-        opened = await self.battle_check_opened()
-        if opened is None:
-            return
-        if not opened:
-            if not await self.battle_open_activity():
-                return
-        else:
-            self.battle_log("冲榜已开启")
-
-        records = await self.battle_get(
-            "/activity/lottery/recordList", {"activityId": CLOUD_BATTLE_ACTIVITY_ID}
-        )
-        if str((records.get("meta") or {}).get("code")) != "200":
-            self.battle_log(f"查询抽奖记录失败 {response_summary(records)}")
-            return
-        record_list = records.get("result")
-        if not isinstance(record_list, list):
-            self.battle_log(
-                f"查询抽奖记录失败 result非list {response_summary(records)}"
-            )
-            return
-        if self.battle_drawn_today(record_list):
-            self.battle_log("今日已抽奖")
-            return
-
-        if not await self.battle_province_ranking():
-            return
-
-        times, _ = await self.battle_lottery_times()
-        if times is None:
-            return
-        if times <= 0:
-            if await self.battle_upload_file():
-                if not await self.battle_province_ranking():
-                    return
-            else:
-                # 服务端可能已收到上传（60s ReadTimeout 后仍计数），不能直接放弃
-                self.battle_log("上传疑似超时，仍尝试查询抽奖次数")
-            times = await self.battle_wait_lottery_times()
-            if times is None or times <= 0:
-                return
-        else:
-            self.battle_log(f"抽奖次数 {times}")
-
-        await self.battle_draw_lottery()
-
-    # === 云手机积分 / 夏日刮一刮 / 打卡挑战赛 ===
+    # === 8. 云手机积分 / 夏日刮一刮 / 打卡挑战赛 ===
     def uphone_biz_ok(self, data):
         """业务成功：data 必须为 dict 且 code 表示成功。"""
         if not isinstance(data, dict):
@@ -3800,8 +3234,12 @@ class Unicom:
             self.tlog(f"积分不足十连 余额={balance} 需≥{UPHONE_LOTTERY_COST}")
             return
         remain = await self.uphone_lottery10_remain()
-        if remain == 0:
-            self.tlog("十连次数已用完 remainUser=0")
+        if remain <= 0:
+            self.tlog(
+                "十连次数已用完 remainUser=0"
+                if remain == 0
+                else "十连次数查询失败, 跳过(状态不明不消耗积分)"
+            )
             return
         r = await self.req(
             "POST",
@@ -4056,7 +3494,7 @@ class Unicom:
 
 
 
-    # === 11. 沃阅读/爱听积分 (每账号自动换票) ===
+    # === 9. 沃阅读/爱听积分 (每账号自动换票) ===
     async def woread_task(self):
         """沃阅读积分: ecs_token → accountLogin 换凭证 → 换票 → 刷时长 → 领积分
         链路: chinaUnicomCookie → onLine(ecs_token) → /account/login(手机号) → token/verifyCode
@@ -4131,7 +3569,8 @@ class Unicom:
             user_id = d.get("userid", "")
             user_index = d.get("userindex", "")
             if not token or not verify_code:
-                self.tlog(f"accountLogin 凭证不完整: {d}")
+                missing = ",".join(k for k in ("token", "verifycode") if not d.get(k))
+                self.tlog(f"accountLogin 凭证不完整: 缺少 {missing}")
                 return
             self.tlog(f"登录成功: {self.mobile[:3]}****{self.mobile[-4:]} 凭证已换")
             user_fields = {
@@ -4148,7 +3587,7 @@ class Unicom:
                 self.tlog(f"换票失败: {api_response_err(r, 'getPointCenterTicket')}")
                 return
             ticket = re.search(r"ticket=([^&]+)", well_url).group(1)
-            self.tlog(f"换票成功 ticket={ticket[:16]}...")
+            self.tlog("换票成功")  # ticket 不入日志
 
             # ④ getSecretKey
             WELL_UA = hdrs["User-Agent"]
@@ -4279,7 +3718,7 @@ class Unicom:
         except Exception as e:
             self.tlog_exc(e, "沃阅读积分")
 
-    # === 12. 云盘校园季（燃动开学季）: 每日上传 + 抽奖 ===
+    # === 10. 云盘校园季（燃动开学季）: 每日上传 + 抽奖 ===
     CAMPUS_ACTIVITY_ID = "MzU="
     CAMPUS_UPLOAD_URL = "https://tjupload.pan.wo.cn/openapi/client/upload2C"
 
@@ -4379,6 +3818,573 @@ class Unicom:
         except Exception as e:
             return False, str(e)[:120]
 
+    # --- 沃视频内容转存（校园季"转存教育内容"/"转存娱乐盘内容"任务） ---
+
+    WO_VIDEO_UA = (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) LianTongYunPan/6.2.0 (iPhone; iOS 27.0)"
+    )
+
+    def pan_app_headers(self):
+        """s.pan.wo.cn 竖版 App 请求头（ticket / 校园 tab 用）。"""
+        token = self.cloud_disk_token()
+        return {
+            "X-YP-Access-Token": token,
+            "Access-Token": token,
+            "Client-Id": "1001000035",
+            "app-type": "liantongyunpanapp",
+            "App-Version": "yp-app/6.2.0",
+            "bundleid": "com.chinaunicom.bol.cloud",
+            "User-Agent": "LianTongYunPan/6.2.0 (iPhone;iOS 27.0)",
+            "Content-Type": "application/json",
+        }
+
+    async def wo_ticket(self):
+        """取云盘 ticket（进沃视频详情页的通行证）。"""
+        r = await self.req(
+            "GET",
+            "https://s.pan.wo.cn/api-user/api/user/ticket",
+            headers=self.pan_app_headers(),
+        )
+        data = r.get("data") if isinstance(r.get("data"), dict) else {}
+        result = data.get("result") if isinstance(data.get("result"), dict) else {}
+        return str(result.get("ticket") or "")
+
+    async def wo_enter(self, content_id, ticket):
+        """打开沃视频详情页，换取 mbh 侧会话；返回 (Referer, h5Token)。"""
+        ua = {"User-Agent": self.WO_VIDEO_UA}
+        referer = (
+            f"{WO_VIDEO_BASE}/YunPanVideoV4/index.html?id={content_id}"
+            f"&ticket={quote(ticket)}"
+        )
+        await self.req("GET", referer, headers=ua)
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        sign = hashlib.md5(f"{ticket}dncj@2181{ts}spamx1a7s".encode()).hexdigest().upper()
+        await self.req(
+            "POST",
+            f"{WO_VIDEO_BASE}/TjCenter/wovideo/h5/getCookie",
+            headers={**ua, "Content-Type": "application/json"},
+            json={"timestamp": ts, "md5": sign, "mobile": ticket, "clientType": "3"},
+        )
+        info = await self.req(
+            "GET",
+            f"{WO_VIDEO_BASE}/TjCenter/wovideo/check/getUserInfoByCookie",
+            headers=ua,
+        )
+        data = info.get("data") if isinstance(info.get("data"), dict) else {}
+        inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+        return referer, str(inner.get("h5Token") or "")
+
+    async def wo_dispatcher(self, api_key, body, referer):
+        """POST /WoYunPanA/woapi/dispatcher（body AES 加密），返回 RSP。"""
+        r = await self.req(
+            "POST",
+            f"{WO_VIDEO_BASE}/WoYunPanA/woapi/dispatcher",
+            headers={
+                "User-Agent": self.WO_VIDEO_UA,
+                "Content-Type": "application/json",
+                "Origin": WO_VIDEO_BASE,
+                "Referer": referer,
+                "key": api_key,
+                "channel": WO_VIDEO_CHANNEL,
+            },
+            json={
+                "header": {"key": api_key, "channel": WO_VIDEO_CHANNEL},
+                "body": wo_aes_b64(
+                    json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+                ),
+            },
+        )
+        data = r.get("data") if isinstance(r.get("data"), dict) else {}
+        rsp = data.get("RSP")
+        if str(data.get("STATUS")) != "200" or not isinstance(rsp, dict):
+            return {}
+        return rsp
+
+    async def wo_transfer_status(self, media_id, referer):
+        """转存状态：True=已转存，False=未转存，None=查询失败。"""
+        rsp = await self.wo_dispatcher(
+            "JudgeFileTransferStatus",
+            {"userId": self.mobile, "fileUniqueValue": wo_des_b64(media_id)},
+            referer,
+        )
+        if str(rsp.get("RSP_CODE")) != "0000":
+            return None
+        try:
+            return wo_aes_unb64(str(rsp.get("DATA") or "")) != "0"
+        except Exception:
+            return None
+
+    async def wo_file_transfer(
+        self, main_id, media_id, name, file_size, referer, space_type=None
+    ):
+        """WoFileTransfer 提交转存；返回 (是否成功, 说明)。"""
+        now = datetime.now().strftime("%Y%m%d%H%M%S")
+        detail = {
+            "mainContentId": main_id,
+            "contentId": media_id,
+            "userId": self.mobile,
+            "time": now,
+        }
+        body = {
+            "userId": self.mobile,
+            "clientId": WO_VIDEO_CHANNEL,
+            "fileName": name,
+            "fileSize": int(file_size or 0)
+            or random.randint(1024 * 1024, 2 * 1024 * 1024),
+            "fileUniqueValue": wo_des_b64(media_id),
+            "fileDetailLink": wo_des_b64(
+                json.dumps(detail, ensure_ascii=False, separators=(",", ":"))
+            ),
+        }
+        if space_type:
+            body["spaceType"] = str(space_type)
+        rsp = await self.wo_dispatcher("WoFileTransfer", body, referer)
+        code = str(rsp.get("RSP_CODE") or "")
+        if code == "0000":
+            return True, "成功"
+        return False, f"RSP_CODE={code or '无'}"
+
+    async def wo_content_package(self, content_id):
+        """查教育课程包，返回第 1 集 (media_id, name, file_size)；非课程包返回 None。"""
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        signature = (
+            hashlib.sha256(
+                f"foQ9ma89UoOkDMFs{self.mobile}{content_id}{ts}".encode()
+            ).hexdigest()
+            + ts
+        )
+        r = await self.req(
+            "POST",
+            f"{WO_VIDEO_BASE}/GW/queryContentPackageDetailForWV",
+            headers={"User-Agent": self.WO_VIDEO_UA, "Content-Type": "application/json"},
+            json={
+                "userId": self.mobile,
+                "contentId": content_id,
+                "count": 50,
+                "offset": 0,
+                "accessChannel": "91",
+                "signature": signature,
+            },
+        )
+        data = r.get("data") if isinstance(r.get("data"), dict) else {}
+        detail = (
+            data.get("contentPackageDetail")
+            if isinstance(data.get("contentPackageDetail"), dict)
+            else {}
+        )
+        episodes = (
+            detail.get("mobVodDetails")
+            if isinstance(detail.get("mobVodDetails"), list)
+            else []
+        )
+        if not episodes or not isinstance(episodes[0], dict):
+            return None
+        ep = episodes[0]
+        media_id = str(ep.get("id") or ep.get("code") or "")
+        if not media_id:
+            return None
+        name = re.sub(r"\s+", "", str(ep.get("name") or ""))
+        media_files = ep.get("mediaFiles") if isinstance(ep.get("mediaFiles"), list) else []
+        size = 0
+        if media_files and isinstance(media_files[0], dict):
+            sizes = media_files[0].get("fileSize") or []
+            size = int(sizes[0]) if sizes else 0
+        return media_id, name, size
+
+    async def wo_authorize_edu(self, h5_token, referer):
+        """教育产品授权（转存教育内容前置，失败不阻塞）。"""
+        code = quote(quote(wo_des_b64("authType=1", "8wrap2ih"), safe=""), safe="")
+        r = await self.req(
+            "POST",
+            f"{WO_VIDEO_BASE}/TjCenter/cloudDrive/authorizeEduProduct",
+            params={"code": code, "platform": "h5"},
+            headers={
+                "User-Agent": self.WO_VIDEO_UA,
+                "h5-token": h5_token,
+                "Referer": referer,
+            },
+            json={},
+        )
+        data = r.get("data") if isinstance(r.get("data"), dict) else {}
+        inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+        return str(data.get("status")) == "0" and inner.get("isSuccess") == 1
+
+    async def campus_tab_videos(self, tab_code):
+        """校园 tab 内指向沃视频详情页的内容 [(content_id, title)]。"""
+        r = await self.req(
+            "GET",
+            "https://s.pan.wo.cn/api/bff/home/school/v2/tab/content",
+            params={"tabCode": tab_code},
+            headers=self.pan_app_headers(),
+        )
+        data = r.get("data") if isinstance(r.get("data"), dict) else {}
+        sections = data.get("result") if isinstance(data.get("result"), list) else []
+        videos = []
+        for section in sections:
+            items = section.get("data") if isinstance(section, dict) else None
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                m = re.search(
+                    r"YunPanVideoV4/index\.html\?id=([0-9A-Za-z]+)",
+                    str(item.get("jumpUrl") or ""),
+                )
+                if m and m.group(1) not in {v[0] for v in videos}:
+                    videos.append((m.group(1), str(item.get("title") or "")))
+        return videos
+
+    async def campus_transfer_targets(self, kind):
+        """候选转存内容（校园 tab 动态发现 + 兜底 id）。
+
+        返回 [(main_id, media_id, name, file_size, space_type)]。
+        """
+        tab = "school_tab_learning" if kind == "edu" else "school_tab_entertainment"
+        targets = []
+        for content_id, title in await self.campus_tab_videos(tab):
+            name = re.sub(r"\s+", "", title)
+            if kind == "edu":
+                ep = await self.wo_content_package(content_id)
+                if ep:
+                    targets.append((content_id, ep[0], ep[1], ep[2], "76"))
+                    continue
+                targets.append((content_id, content_id, name, 0, "76"))
+            else:
+                targets.append((content_id, content_id, name, 0, None))
+        fallback = CAMPUS_EDU_FALLBACK_ID if kind == "edu" else CAMPUS_ENT_FALLBACK_ID
+        if fallback:
+            ep = await self.wo_content_package(fallback) if kind == "edu" else None
+            if ep:
+                targets.append((fallback, ep[0], ep[1], ep[2], "76"))
+            else:
+                targets.append(
+                    (fallback, fallback, CAMPUS_FALLBACK_NAME[kind], 0, "76" if kind == "edu" else None)
+                )
+        return targets[:12]  # 候选过多时只试前几个，避免无谓耗时
+
+    async def campus_transfer(self, kind):
+        """校园季转存任务：kind=edu 转存教育内容 / ent 转存娱乐盘内容。"""
+        label = "教育" if kind == "edu" else "娱乐"
+        targets = await self.campus_transfer_targets(kind)
+        if not targets:
+            self.tlog(f"转存{label}: 未找到可转存内容")
+            return False
+        skipped = None
+        for main_id, media_id, name, size, space_type in targets:
+            ticket = await self.wo_ticket()
+            if not ticket:
+                self.tlog(f"转存{label}: ticket 获取失败")
+                return False
+            referer, h5_token = await self.wo_enter(main_id, ticket)
+            if kind == "edu" and h5_token:
+                await self.wo_authorize_edu(h5_token, referer)
+            status = await self.wo_transfer_status(media_id, referer)
+            if status is None:
+                self.tlog(f"转存{label}: [{name}] 状态查询失败, 试下一个")
+                continue
+            if status:
+                skipped = skipped or (main_id, media_id, name, size, space_type, referer)
+                continue
+            ok, msg = await self.wo_file_transfer(
+                main_id, media_id, name, size, referer, space_type
+            )
+            if ok:
+                self.tlog(f"转存{label}: [{name}] 成功")
+                return True
+            self.tlog(f"转存{label}: [{name}] 失败 {msg}")
+        if skipped:
+            # 候选都已转存过：重转一条碰运气（服务端裁决，可能计入当日任务）
+            main_id, media_id, name, size, space_type, referer = skipped
+            ok, msg = await self.wo_file_transfer(
+                main_id, media_id, name, size, referer, space_type
+            )
+            self.tlog(
+                f"转存{label}: [{name}] 已转存过"
+                + ("，重复转存已计入" if ok else f"（服务端未计入: {msg}）")
+            )
+            if ok:
+                return True
+        if kind == "ent":
+            # mbh 渠道无新内容 → 芒果TV（需会员）→ mbh 影视库（不限会员）
+            ok, info = await self.mgtv_transfer()
+            if ok:
+                self.tlog(f"转存{label}: 芒果TV内容源 成功 [{info}]")
+                return True
+            self.tlog(f"转存{label}: 芒果TV内容源 {info}")
+            ok, info = await self.mbh_channel_transfer(self.MBH_MOVIE_SUBJECTS)
+            self.tlog(
+                f"转存{label}: mbh影视库 "
+                + (f"成功 [{info}]" if ok else f"未找到可用内容: {info}")
+            )
+            return ok
+        # 教育：mbh 教育频道兜底（学习盘课程耗尽后）
+        ok, info = await self.mbh_channel_transfer(
+            self.MBH_EDU_SUBJECTS, space_type="76", package_mode=True
+        )
+        self.tlog(
+            f"转存{label}: mbh教育频道 " + (f"成功 [{info}]" if ok else f"未找到可用内容: {info}")
+        )
+        return ok
+
+    # --- 芒果TV(mgtv) 内容转存：娱乐盘任务长期内容源 ---
+
+    MGTV_ACT_API = "https://mgcact.api.mgtv.com"
+    MGTV_CLUB_API = "https://mgcclub.api.mgtv.com"
+    MGTV_CLUB_ACTIVITY = "d5b02f34be217c4d"
+    MGTV_FALLBACK_HIDS = ("896231", "867929", "859271")
+
+    def mgtv_headers(self):
+        """芒果侧请求头。"""
+        return {
+            "User-Agent": self.WO_VIDEO_UA,
+            "Origin": "https://pop.mgtv.com",
+            "Referer": "https://pop.mgtv.com/",
+        }
+
+    async def mgtv_session(self):
+        """用云盘 ticket 换 mgtv 会话 ticket。"""
+        ts = await self.req(
+            "GET",
+            "https://s.pan.wo.cn/api-user/api/user/ticket",
+            headers=self.pan_app_headers(),
+        )
+        ticket = ((ts.get("data") or {}).get("result") or {}).get("ticket")
+        if not ticket:
+            return ""
+        r = await self.req(
+            "GET",
+            f"{self.MGTV_ACT_API}/api/cu/login",
+            params={"ticket": ticket, "t": int(time.time() * 1000)},
+            headers=self.mgtv_headers(),
+        )
+        data = (r.get("data") or {}).get("data") or {}
+        return str(data.get("ticket") or "")
+
+    async def mgtv_hids(self, st):
+        """club/homepage 取全部可转存内容 hid（约 140 档）。"""
+        r = await self.req(
+            "POST",
+            f"{self.MGTV_CLUB_API}/api/mgc/club/homepage",
+            headers={**self.mgtv_headers(), "Content-Type": "application/json"},
+            json={
+                "ticket": st,
+                "t": int(time.time() * 1000),
+                "activityId": self.MGTV_CLUB_ACTIVITY,
+                "isMgApp": 0,
+            },
+        )
+        data = (r.get("data") or {}).get("data") or {}
+        hids = []
+        for model in data.get("list") or []:
+            for item in model.get("modelDataList") or []:
+                hid = str(item.get("words1") or "").strip()
+                if hid.isdigit() and hid not in hids:
+                    hids.append(hid)
+        return hids or list(self.MGTV_FALLBACK_HIDS)
+
+    async def mgtv_episodes(self, st, hid):
+        """encrypt + episodes：返回 (hcode, 集列表)。"""
+        r = await self.req(
+            "POST",
+            f"{self.MGTV_ACT_API}/api/cu/mediaId/encrypt",
+            headers={**self.mgtv_headers(), "Content-Type": "application/json"},
+            json={
+                "ticket": st,
+                "t": int(time.time() * 1000),
+                "hid": str(hid),
+                "vids": "1",
+            },
+        )
+        hcode = ((r.get("data") or {}).get("data") or {}).get("hcode")
+        if not hcode:
+            return "", []
+        r2 = await self.req(
+            "GET",
+            f"{self.MGTV_ACT_API}/api/cu/media/episodes",
+            params={"ticket": st, "t": int(time.time() * 1000), "mediaId": hcode},
+            headers=self.mgtv_headers(),
+        )
+        eps = (r2.get("data") or {}).get("data")
+        return str(hcode), eps if isinstance(eps, list) else []
+
+    async def mgtv_transfer_ep(self, st, hcode, ep):
+        """转存单个分集。"""
+        r = await self.req(
+            "POST",
+            f"{self.MGTV_ACT_API}/api/cu/woFileTransfer",
+            headers={**self.mgtv_headers(), "Content-Type": "application/json"},
+            json={
+                "ticket": st,
+                "t": int(time.time() * 1000),
+                "fileName": str(ep.get("title") or "视频"),
+                "clipId": hcode,
+                "partId": str(ep.get("vcode") or ""),
+                "fileType": "2",
+            },
+        )
+        return r.get("data") or {}
+
+    async def mgtv_transfer(self, max_tries=15):
+        """扫描芒果内容池，转存一集未转存内容；返回 (是否成功, 说明)。"""
+        st = await self.mgtv_session()
+        if not st:
+            return False, "mgtv 会话获取失败"
+        hids = list(await self.mgtv_hids(st))
+        random.shuffle(hids)  # 每次随机顺序，避免总扫前面已耗尽的档
+        tries = 0
+        for hid in hids[:24]:  # 单次运行最多扫 24 档
+            hcode, eps = await self.mgtv_episodes(st, hid)
+            if not eps:
+                continue
+            free = [e for e in eps if int(e.get("isPay") or 0) == 0]
+            paid = [e for e in eps if int(e.get("isPay") or 0) != 0][:3]
+            for ep in free + paid:
+                if tries >= max_tries:
+                    return False, f"尝试 {tries} 集均未成功"
+                tries += 1
+                rsp = await self.mgtv_transfer_ep(st, hcode, ep)
+                code = str(rsp.get("code") or "")
+                if code == "0000":
+                    return True, str(ep.get("title") or "")[:40]
+                if "无会员权益" in str(rsp.get("msg") or ""):
+                    return False, "账号无芒果会员, 跳过芒果内容源"
+        return False, f"扫描 {tries} 集均未成功"
+
+    # --- mbh 频道内容源（不限会员，电影/课程）---
+
+    MBH_MOVIE_SUBJECTS = ("catauto1111125306", "catauto1111125307")
+    MBH_EDU_SUBJECTS = ("catauto1111134283", "catauto1111134308")
+
+    async def mbh_channel_items(self, subjects, count=50):
+        """拉 mbh 频道内容列表，返回 [(code, name)]。"""
+        r = await self.req(
+            "POST",
+            f"{WO_VIDEO_BASE}/jsp/V3/QueryVODAndChannelBatch",
+            headers={"User-Agent": self.WO_VIDEO_UA, "Content-Type": "application/json"},
+            json={
+                "subjects": [
+                    {"woSubjectID": s, "count": count, "offset": 0} for s in subjects
+                ],
+                "versionName": "8.1.0",
+            },
+        )
+        data = r.get("data") if isinstance(r.get("data"), dict) else {}
+        items = []
+        for channel in data.get("contents") or []:
+            if not isinstance(channel, dict):
+                continue
+            for v in channel.get("vc") or []:
+                content = v.get("woContent") if isinstance(v, dict) else None
+                if not isinstance(content, dict):
+                    continue
+                code = str(content.get("code") or "")
+                name = str(content.get("name") or "")
+                if code and name and (code, name) not in items:
+                    items.append((code, name))
+        return items
+
+    async def mbh_channel_transfer(
+        self, subjects, space_type=None, package_mode=False, max_tries=10
+    ):
+        """扫描 mbh 频道内容，转存一条未转存内容；返回 (是否成功, 说明)。"""
+        items = await self.mbh_channel_items(subjects)
+        if not items:
+            return False, "频道列表获取失败"
+        random.shuffle(items)
+        for code, name in items[:max_tries]:
+            media_id, file_name, file_size = code, name, 0
+            if package_mode:
+                ep = await self.wo_content_package(code)
+                if ep:
+                    media_id, file_name, file_size = ep[0], ep[1], ep[2]
+            ticket = await self.wo_ticket()
+            if not ticket:
+                return False, "ticket 获取失败"
+            referer, h5_token = await self.wo_enter(code, ticket)
+            if package_mode and h5_token:
+                await self.wo_authorize_edu(h5_token, referer)
+            status = await self.wo_transfer_status(media_id, referer)
+            if status is not False:
+                continue  # 已转存或查询失败，试下一个
+            ok, _ = await self.wo_file_transfer(
+                code, media_id, file_name, file_size, referer, space_type
+            )
+            if ok:
+                return True, file_name[:40]
+        return False, f"尝试 {min(len(items), max_tries)} 条均未成功"
+
+    # --- 学习助手 AI 对话（"体验学习助手"任务 30008）---
+
+    AI_WORKFLOW_REFERER = "https://panservice.mail.wo.cn/h5/wocloud_ai_1/workFlow?activeTab=2"
+
+    def ai_headers(self):
+        """沃云盘 AI 工作流请求头。"""
+        token = self.cloud_disk_token()
+        return {
+            "X-YP-Access-Token": token,
+            "token": token,
+            "accesstoken": token,
+            "Access-Token": token,
+            "source-type": "woapi",
+            "clientId": "1001000035",
+            "Client-Id": "1001000035",
+            "X-YP-Client-Id": "1001000035",
+            "X-YP-App-Version": "6.2.0",
+            "X-YP-Open-Version": "v1.0",
+            "Content-Type": "application/json",
+            "requestTime": str(int(time.time() * 1000)),
+            "User-Agent": self.WO_VIDEO_UA,
+            "Origin": "https://panservice.mail.wo.cn",
+            "Referer": self.AI_WORKFLOW_REFERER,
+        }
+
+    async def campus_ai_chat(self):
+        """体验学习助手：发起一次 AI 对话（SSE 流式），返回是否成功。
+        总是新建会话，不查询/复用已有会话，避免污染用户聊天记录。"""
+        conv_id = ""
+        body = {
+            "input": "你好，请用一句话介绍一下你自己",
+            "modelId": 0,
+            "platform": 2,
+            "tag": 0,
+            "conversationId": conv_id,
+            "knowledgeId": "",
+            "referFileInfo": [],
+            "messageId": "",
+            "conversationType": "bot",
+            "recipient": "",
+            "aiExtra": "",
+            "async": "1",
+        }
+        headers = {**self.ai_headers(), "Accept": "text/event-stream"}
+        url = "https://panservice.mail.wo.cn/wohome/ai/assistant/query"
+        bytes_read = 0
+
+        async def read_stream():
+            nonlocal bytes_read
+            async with self.client.stream(
+                "POST", url, headers=headers, json=body, timeout=120.0
+            ) as r:
+                if r.status_code != 200:
+                    return f"HTTP {r.status_code}"
+                async for chunk in r.aiter_bytes():
+                    bytes_read += len(chunk)
+            return ""
+
+        try:
+            err = await asyncio.wait_for(read_stream(), timeout=90)
+        except asyncio.TimeoutError:
+            self.tlog(f"AI对话: 流读取超时(90 秒), 已收 {bytes_read} 字节")
+            return bytes_read > 0
+        except Exception as e:
+            self.tlog(f"AI对话: 异常 {self.format_exc(e)}")
+            return False
+        if err:
+            self.tlog(f"AI对话: 失败 {err}")
+            return False
+        self.tlog(f"AI对话: 完成 (会话 {conv_id or '新建'}, 流 {bytes_read} 字节)")
+        return True
+
     async def campus_task(self):
         """校园季: 激活 -> 上传 -> 查进度 -> 自动抽奖"""
         self._task_tag = "校园季"
@@ -4399,18 +4405,53 @@ class Unicom:
                 self.tlog(f"激活失败 {response_summary(d or r)}")
                 return
 
-            ok, msg = await self.campus_upload()
-            self.tlog(f"上传{'成功' if ok else '失败'}: {msg}")
-            if not ok:
-                return
-            await asyncio.sleep(3)
-
+            # 先查任务状态：已满的任务不再执行，避免重复上传/转存/AI 对话。
+            # 查询失败时 done 为空 -> 全部照常执行，保持原行为。
             tl = await self.campus_signed_post(
                 "/activity/school/task/list", "activity:school:activate"
             )
+            done = {}
             for t in (tl.get("result") or {}).get("taskList") or []:
-                if t.get("taskCode") == "30004":
-                    self.tlog(f"上传任务进度: {t.get('doneCount')}/{t.get('dailyLimit')}")
+                code = str(t.get("taskCode") or "")
+                if code in ("30004", "30005", "30007", "30008"):
+                    try:
+                        done[code] = int(t.get("doneCount") or 0) >= int(
+                            t.get("dailyLimit") or 0
+                        )
+                    except (TypeError, ValueError):
+                        done[code] = False
+                    self.tlog(
+                        f"任务[{t.get('taskName')}]: {t.get('doneCount')}/{t.get('dailyLimit')}"
+                        + (" (已满)" if done[code] else "")
+                    )
+
+            if done.get("30004"):
+                self.tlog("上传任务已满, 跳过")
+            else:
+                ok, msg = await self.campus_upload()
+                self.tlog(f"上传{'成功' if ok else '失败'}: {msg}")
+                if ok:
+                    await asyncio.sleep(3)
+
+            # 转存任务（教育/娱乐各 1 条）——独立于上传，失败只记录不阻断抽奖
+            for kind, tcode in (("edu", "30005"), ("ent", "30007")):
+                if done.get(tcode):
+                    self.tlog("教育转存任务已满, 跳过" if kind == "edu" else "娱乐转存任务已满, 跳过")
+                    continue
+                try:
+                    await self.campus_transfer(kind)
+                except Exception as e:
+                    self.tlog_exc(e, "转存")
+                await asyncio.sleep(2)
+
+            # 学习助手体验任务（30008）：发起一次 AI 对话
+            if done.get("30008"):
+                self.tlog("AI任务已满, 跳过")
+            else:
+                try:
+                    await self.campus_ai_chat()
+                except Exception as e:
+                    self.tlog_exc(e, "AI对话")
 
             lt = await self.req(
                 "GET",
@@ -4445,11 +4486,9 @@ class Unicom:
                 "market": self.market_task,
                 "sign": self.sign_task,
                 "xj": self.xj_task,
-                "ttlxj": self.ttlxj_task,
                 "ltzf": self.ltzf_task,
                 "sec": self.sec_task,
                 "farm": self.farm_task,
-                # "cloud_battle": self.cloud_battle_task,  # 上传大比拼已下线 (2026-08-06)
                 "shangdu": self.shangdu_task,
                 "uphone": self.uphone_task,
                 "woread": self.woread_task,
@@ -4466,11 +4505,10 @@ class Unicom:
                     self.market_task,
                     self.sign_task,
                     self.xj_task,
-                    self.ttlxj_task,
+                    # singer/puzzle/ttlxj 已整体删除(2026-09-12): 活动均已结束，代码不再保留
                     self.ltzf_task,
                     self.sec_task,
                     self.farm_task,
-                    # self.cloud_battle_task,  # 上传大比拼已下线 (2026-08-06)
                     self.shangdu_task,
                     self.uphone_task,
                     self.woread_task,
@@ -4485,6 +4523,11 @@ class Unicom:
             }
             if skip:
                 skipped = [n for n in skip if n in task_map]
+                unknown = sorted(n for n in skip if n not in task_map)
+                if unknown:
+                    self.log(
+                        f"UNICOM_SKIP_TASK 含未知任务名: {','.join(unknown)} (可选: {list(task_map)})"
+                    )
                 tasks = [t for t in tasks if t not in {task_map[n] for n in skipped}]
                 if skipped:
                     self.log(f"已按 UNICOM_SKIP_TASK 跳过: {','.join(sorted(skipped))}")
@@ -4498,8 +4541,10 @@ class Unicom:
 
 
 async def main():
-    # 10点开抢/日期比对/周日判断都依赖本地时区，容器 TZ 为空时显式钉死
-    os.environ.setdefault("TZ", "Asia/Shanghai")
+    NOTIFY_LINES.clear()  # 进程内重复调用 main() 时不累积上次通知
+    # 10点开抢/日期比对/周日判断都依赖本地时区，容器 TZ 为空(含空串)时显式钉死
+    if not os.environ.get("TZ"):
+        os.environ["TZ"] = "Asia/Shanghai"
     if hasattr(time, "tzset"):
         time.tzset()
     print(f"开始: {datetime.now():%Y-%m-%d %H:%M:%S} TZ={os.environ.get('TZ')}")
@@ -4515,12 +4560,16 @@ async def main():
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            print(f"账号{i + 1} 未捕获异常: {result}", flush=True)
+            line = f"账号{i + 1} 未捕获异常: {format_exception_detail(result)}"
+            print(line, flush=True)
+            NOTIFY_LINES.append(line)
     push_lines = [
         l
         for l in NOTIFY_LINES
         if any(k in l for k in ("失败", "异常", "成功", "抽奖"))
     ]
+    if len(push_lines) > 100:  # 通知体积上限
+        push_lines = push_lines[:100] + [f"... 其余 {len(push_lines) - 100} 行已省略"]
     if push_lines:
         notify_send("中国联通任务", "\n".join(push_lines))
     print("结束")
