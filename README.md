@@ -29,6 +29,7 @@ cu.py
 | 云手机积分 | `uphone_task` | 见下方说明 |
 | 沃阅读积分 | `woread_task` | 每账号自动换票 |
 | 校园季 | `campus_task` | 上传 / 转存 / AI 对话 / 抽奖，需云盘 token |
+| 上传大比拼 | `cloud_battle_task` | 上传冲榜 / 每日上传得抽奖，需云盘 token |
 
 ### 云手机（`uphone_task`）
 
@@ -49,6 +50,17 @@ cu.py
    （需芒果会员，无权益秒退）→ mbh 影视/教育频道（不限会员），
    内容池耗尽自动切换，已转存过的内容自动跳过
 4. **自动抽奖**（次数本地硬上限保护）
+
+### 上传大比拼（`cloud_battle_task`）
+
+与校园季同源的 panservice 签名 / upload2C 上传协议，但页面、活动 ID、上传域名独立：
+
+1. 进入活动页经 `openPlatLineNew.htm` 跳转拿带 ticket 的 Referer（lottery-times 必需）
+2. 校验 `activity-status` 与冲榜开启状态；未开启则用归属省自动开启
+3. 无抽奖次数时上传 1 个占位文件，轮询次数到账
+4. **自动抽奖**（每日 1 次，首次必中）；榜单查询失败不阻断抽奖
+
+`activityId` 每期更换（30 → 38），下期换活动只需改 `UNICOM_BATTLE_ACTIVITY_ID`。
 
 ## 快速开始
 
@@ -85,6 +97,10 @@ python cu.py
 | `UNICOM_TTXC_HARVEST_WAIT` | `3` | 收获等待秒数 |
 | `UNICOM_CAMPUS_EDU_ID` | 见源码 | 校园季教育转存兑底内容 ID |
 | `UNICOM_CAMPUS_ENT_ID` | 见源码 | 校园季娱乐转存兑底内容 ID |
+| `UNICOM_BATTLE_ACTIVITY_ID` | `Mzg=` | 上传大比拼活动 ID（每期更换） |
+| `UNICOM_BATTLE_UPLOAD_URL` | 见源码 | 上传大比拼上传域名（逗号分隔多候选） |
+| `UNICOM_CLOUD_BATTLE_FILE` | `文本.txt` | 上传大比拼占位文件名 |
+| `UNICOM_CLOUD_BATTLE_CONTENT` | `1` | 上传大比拼占位文件内容 |
 | `SHANGDU_LOTTERY_MAX` | 剩余次数 | 单次最多抽奖次数 |
 | `UNICOM_UPHONE_LOTTERY_COST` | `100` | 云手机积分十连触发余额阈值 |
 
